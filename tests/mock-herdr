@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Fake herdr CLI for the tests.
+
+Reads and writes a JSON state file ($MOCK_STATE) instead of a real herdr, to check devlayout's flows.
+Output shapes follow the real herdr 0.9.5 CLI (checked 2026-10-30):
+  workspace create -> .result.root_pane / .workspace / .tab,  pane split -> .result.pane (the new pane only)
+Update this file when the real output changes.
+
+Supports: workspace list|create|get|focus, pane list|get|split|rename|run|close|process-info,
+          notification show, status server
+Pane ids look like herdr's "<ws>:p<n>" (n in the base-32 DIGITS below), tab ids "<ws>:t<n>".
+Closed pane ids are never reused and the remaining ids never change (as in herdr).
+Text typed with `pane run` is recorded in state["runs"].
+"""
+import json
+import os
+import sys
+
+STATE = os.environ["MOCK_STATE"]
+
+
+def load():
+    with open(STATE) as f:
+        return json.load(f)
+
+
+def save(s):
+    with open(STATE, "w") as f:
+        json.dump(s, f, indent=1)
+
+
+def out(obj):
+    print(json.dumps({"id": "cli", "result": obj}))
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# Pane numbers, as in herdr 0.9.5: base 32 with digits 1..9, A..Z (no I L O U), 0 meaning 1..32 (no zero).
+# Observed: p9 -> pA … pZ -> p0 -> p11 … p1Z -> p10 -> p21
+DIGITS = "123456789ABCDEFGHJKMNPQRSTVWXYZ0"
+
+
+def enc(n):
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 32)
+        out = DIGITS[r] + out
+    return out
+
+
+def num(pid):
+    n = 0
+    for ch in pid.rsplit("p", 1)[1]:
+        n = n * 32 + DIGITS.index(ch) + 1
+    return n
+
+
+def find_pane(s, pid):
+    for p in s["panes"]:
+        if p["pane_id"] == pid:
+            return p
+    fail(f"pane {pid} not found")
+
+
+def opt(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        return args[i + 1]
+    return default
+
+
+def main(argv):
+    s = load()
+    # Fix the next number per workspace on first read, so closed ids are never reused
+    nxt = s.setdefault("next", {})
+    for p in s["panes"]:
+        w = p["workspace_id"]
+        nxt[w] = max(nxt.get(w, 0), num(p["pane_id"]) + 1)
+    if argv[:2] == ["status", "server"]:
+        print("status: running")
+        return
+    if not argv:
+        fail("usage")
+    grp, cmd, rest = argv[0], argv[1] if len(argv) > 1 else "", argv[2:]
+
+    if grp == "workspace":
+        if cmd == "list":
+            out({"type": "workspace_list", "workspaces": s["workspaces"]})
+        elif cmd == "create":
+            wid = f"w{len(s['workspaces']) + 1}"
+            ws = {"workspace_id": wid, "label": opt(rest, "--label", "ws"), "focused": True,
+                  "active_tab_id": f"{wid}:t1"}
+            s["workspaces"].append(ws)
+            s["next"][wid] = 2
+            pane = {"pane_id": f"{wid}:p1", "workspace_id": wid, "tab_id": f"{wid}:t1",
+                    "label": None, "agent": None, "cwd": opt(rest, "--cwd", "/"), "focused": True}
+            for p in s["panes"]:
+                p["focused"] = False
+            s["panes"].append(pane)
+            save(s)
+            out({"type": "workspace_created", "workspace": ws, "tab": {"tab_id": f"{wid}:t1"}, "root_pane": pane})
+        elif cmd == "get":
+            ws = [w for w in s["workspaces"] if w["workspace_id"] == rest[0]]
+            if not ws:
+                fail("workspace not found")
+            out({"type": "workspace_info", "workspace": ws[0]})
+        elif cmd == "focus":
+            ws = [w for w in s["workspaces"] if w["workspace_id"] == rest[0]]
+            if not ws:
+                fail("workspace not found")
+            out({"type": "workspace_info", "workspace": ws[0]})
+        else:
+            fail(f"unknown workspace cmd {cmd}", 2)
+        return
+
+    if grp == "pane":
+        if cmd == "list":
+            wid = opt(rest, "--workspace")
+            ps = [p for p in s["panes"] if wid is None or p["workspace_id"] == wid]
+            out({"type": "pane_list", "panes": ps})
+        elif cmd == "get":
+            out({"type": "pane_info", "pane": find_pane(s, rest[0])})
+        elif cmd == "process-info":
+            # Test-only pane fields: procinfo_fail (command fails), fg_unknown (shell_pid null N times),
+            # fg_starting (a child zsh in front N times while the shell starts - seen on new panes),
+            # fg (name of the program in front; none = the shell). Output shape matches real 0.9.5.
+            p = find_pane(s, opt(rest, "--pane"))
+            if p.get("procinfo_fail"):
+                fail('{"error":"process info unavailable"}')
+            # shell_pid_real: report a real pid as the shell (to give it a real age for `ps -o etime=`)
+            shell = p.get("shell_pid_real") or 1000 + num(p["pane_id"])
+            # fg_later: {"after": N, "prog": X}: the shell is in front for N calls, then X is (like herdr
+            # starting a resumed agent in a pane whose shell just started)
+            later = p.get("fg_later")
+            if later:
+                later["seen"] = later.get("seen", 0) + 1
+                save(s)
+                if later["seen"] > later["after"]:
+                    p["fg"] = later["prog"]
+            info = {"pane_id": p["pane_id"], "shell_pid": shell, "tty": "/dev/ttys000"}
+            if p.get("fg_unknown", 0) > 0:
+                p["fg_unknown"] -= 1
+                save(s)
+                info.update(shell_pid=None, foreground_process_group_id=None, foreground_processes=[])
+            elif p.get("fg_starting", 0) > 0:
+                p["fg_starting"] -= 1
+                save(s)
+                info.update(foreground_process_group_id=shell + 4, foreground_processes=[
+                    {"pid": shell + 4, "name": "zsh", "argv0": "zsh", "argv": ["-zsh"], "cmdline": "-zsh"}])
+            elif p.get("fg"):
+                prog = p["fg"]
+                name = "2.1.312" if prog == "claude" else prog   # real Claude reports its version as name
+                info.update(foreground_process_group_id=shell + 500, foreground_processes=[
+                    {"pid": shell + 500, "name": name, "argv0": prog, "argv": [prog], "cmdline": prog}])
+            else:
+                info.update(foreground_process_group_id=shell, foreground_processes=[
+                    {"pid": shell, "name": "zsh", "argv0": "zsh", "argv": ["-zsh"], "cmdline": "-zsh"}])
+            out({"type": "pane_process_info", "process_info": info})
+        elif cmd == "split":
+            src = find_pane(s, rest[0])
+            wid = src["workspace_id"]
+            n = s["next"][wid]
+            s["next"][wid] = n + 1
+            pane = {"pane_id": f"{wid}:p{enc(n)}", "workspace_id": wid, "tab_id": src["tab_id"],
+                    "label": None, "agent": None, "cwd": opt(rest, "--cwd", src["cwd"]),
+                    "focused": False, "split_dir": opt(rest, "--direction"), "split_from": src["pane_id"],
+                    # MOCK_NEW_PANE_STARTING=N: a new pane looks like its shell is starting for N calls
+                    "fg_starting": int(os.environ.get("MOCK_NEW_PANE_STARTING", "0"))}
+            s["panes"].append(pane)
+            save(s)
+            out({"type": "pane_info", "pane": pane})
+        elif cmd == "rename":
+            p = find_pane(s, rest[0])
+            p["label"] = rest[1]
+            save(s)
+            out({"type": "pane_info", "pane": p})
+        elif cmd == "run":
+            find_pane(s, rest[0])
+            s["runs"].append({"pane": rest[0], "text": rest[1]})
+            save(s)
+        elif cmd == "close":
+            s["panes"].remove(find_pane(s, rest[0]))   # remaining ids stay as they are
+            save(s)
+        else:
+            fail(f"unknown pane cmd {cmd}", 2)
+        return
+
+    if grp == "notification" and cmd == "show":
+        # MOCK_NOTIFY_FAIL=1 makes the command fail, like a herdr without a running client would
+        if os.environ.get("MOCK_NOTIFY_FAIL") == "1":
+            fail('{"error":"notification unavailable"}')
+        s.setdefault("notifications", []).append({"title": rest[0], "body": opt(rest, "--body")})
+        save(s)
+        out({"type": "notification_show", "shown": True, "reason": "shown"})   # real 0.9.5 shape
+        return
+
+    fail(f"unknown group {grp}", 2)
+
+
+main(sys.argv[1:])

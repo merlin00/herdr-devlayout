@@ -1,0 +1,57 @@
+# herdr plugin manifest
+# The id is used in action names and the config path after install: never change it after release.
+id = "merlin00.devlayout"
+name = "Dev Layout"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Agent / editor / review 3-pane dev layout for herdr: build it, repair it after a server restart, or reset it."
+platforms = ["linux", "macos"]
+
+# The manifest does not bind keys. Add these to ~/.config/herdr/config.toml yourself:
+#
+#   [[keys.command]]
+#   key = "prefix+shift+o"
+#   type = "plugin_action"
+#   command = "merlin00.devlayout.open"
+#   description = "dev layout: build / repair"
+#
+#   [[keys.command]]
+#   key = "prefix+shift+l"
+#   type = "plugin_action"
+#   command = "merlin00.devlayout.reset"
+#   description = "dev layout: reset"
+#
+# Actions run without a TTY from the plugin folder; their output goes to `herdr plugin log list --plugin <id>`.
+# (dev) After editing this manifest, unlink and link again: herdr caches the manifest at link time.
+
+[[actions]]
+id = "open"
+title = "Dev layout: build or repair (agent | editor / review)"
+command = ["sh", "bin/devlayout", "open"]
+
+[[actions]]
+id = "reset"
+title = "Dev layout: reset current workspace to the 3-pane layout"
+command = ["sh", "bin/devlayout", "reset"]
+
+[[actions]]
+id = "status"
+title = "Dev layout: print pane / program status (see plugin log)"
+command = ["sh", "bin/devlayout", "status"]
+
+# Runs once when the herdr server starts. Off unless DEVLAYOUT_STARTUP=1 is set in config.env:
+# then it restarts the editor and review programs in every tab that has the devlayout layout.
+# The agent is left to herdr's own [session] resume_agents_on_restore (set DEVLAYOUT_STARTUP_AGENT=1 to include it).
+[[startup]]
+command = ["sh", "bin/devlayout", "startup"]
+
+# Run when herdr creates or opens a workspace for a git worktree. Off unless DEVLAYOUT_WORKTREE=1:
+# then the layout is built in the new workspace (only if its tab still has a single pane).
+# reviewr opens its own pane on the same events unless `auto_open = false` is set in its config.
+[[events]]
+on = "worktree.created"
+command = ["sh", "bin/devlayout", "worktree-event"]
+
+[[events]]
+on = "worktree.opened"
+command = ["sh", "bin/devlayout", "worktree-event"]

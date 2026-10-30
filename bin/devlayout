@@ -1,0 +1,645 @@
+#!/bin/sh
+# devlayout — 3-pane dev layout for herdr
+#
+#   ┌──────────────┬──────────────┐
+#   │ agent        │              │
+#   ├──────────────┤   review     │
+#   │ editor       │              │
+#   └──────────────┴──────────────┘
+#
+# Usage:
+#   devlayout [open]          Build the layout in the current tab, or restart only the programs that are not running
+#   devlayout open <DIR>      Go to the workspace of project DIR (create it if missing) and do the same in its active tab
+#   devlayout reset           Restore the current tab to the 3-pane layout (keeps the agent pane; other tabs untouched)
+#   devlayout status          Show panes and program state of the current tab
+#   devlayout open-file FILE [LINE]   Open FILE in the resident editor (nvim socket); for reviewr's editor setting
+#   devlayout editor-socket [DIR]     Print the nvim socket path of project DIR
+#   devlayout repair-all      In every tab that has the devlayout layout, restart stopped editor/review
+#                             (and agent if DEVLAYOUT_STARTUP_AGENT=1). Never builds, relabels or closes panes
+#   devlayout startup         Run by herdr after a server restart; does repair-all if DEVLAYOUT_STARTUP=1
+#   devlayout worktree-event  Run by herdr when a worktree workspace is created or opened; builds the layout
+#                             there if DEVLAYOUT_WORKTREE=1
+#   devlayout help | version
+#
+# Aliases: `devlayout <DIR>` = open <DIR>, `devlayout --reset` / `-r` = reset.
+# Debug:   DEVLAYOUT_DEBUG=1 devlayout ...
+#
+# Dev note: plain POSIX sh (must run under dash). Needs herdr, jq, ps, sed, awk; git and nvim are optional.
+set -eu
+
+VERSION=0.1.0
+
+# ── Paths and defaults ──────────────────────────────────────
+# When run as a plugin, herdr provides HERDR_BIN_PATH and HERDR_PLUGIN_*_DIR.
+HERDR=${HERDR_BIN_PATH:-herdr}
+STATE_DIR=${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/devlayout}
+CONFIG_DIR=${HERDR_PLUGIN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/devlayout}
+LOG=$STATE_DIR/devlayout.log
+
+# Defaults; override them in $CONFIG_DIR/config.env (see config.example.env).
+DEVLAYOUT_AGENT_NAME=claude                 # agent name as herdr detects it (pane_info.agent)
+DEVLAYOUT_AGENT_CMD=claude                  # command for a new agent session
+DEVLAYOUT_AGENT_RESUME_CMD='claude --continue'  # command to resume the last conversation
+DEVLAYOUT_AGENT_SETTLE=5                    # agent pane shell younger than this (s): wait first, herdr may be resuming the agent
+DEVLAYOUT_RESUME_GRACE=60                   # if resuming fails within this many seconds, start a new session
+DEVLAYOUT_EDITOR=nvim                       # with nvim, start it with a --listen socket
+DEVLAYOUT_EDITOR_CMD=                       # if set, replaces the whole editor command
+DEVLAYOUT_SOCKET_DIR=$HOME/.cache/nvim      # nvim socket dir (<project key>.sock)
+DEVLAYOUT_REVIEW_CMD=herdr-reviewr          # review pane command
+DEVLAYOUT_COOLDOWN=15                       # a program started this many seconds ago counts as running
+DEVLAYOUT_STARTUP=0                         # 1: run repair-all when the herdr server starts ([[startup]] hook)
+DEVLAYOUT_WORKTREE=0                        # 1: build the layout in new worktree workspaces ([[events]] hook)
+DEVLAYOUT_STARTUP_AGENT=0                   # 1: repair-all also resumes the agent (when herdr does not resume it)
+DEVLAYOUT_NOTIFY=auto                       # herdr notification for errors and skipped roles: auto (only without a terminal) | on | off
+DEVLAYOUT_SHELL_WAIT=5                      # wait up to this many seconds for a pane's shell prompt (e.g. a new pane still starting)
+DEVLAYOUT_LABEL_AGENT=claude                # pane labels (herdr pane label)
+DEVLAYOUT_LABEL_EDITOR=nvim
+DEVLAYOUT_LABEL_REVIEW=reviewr
+if [ -f "$CONFIG_DIR/config.env" ]; then
+  # shellcheck disable=SC1091
+  . "$CONFIG_DIR/config.env"
+fi
+
+mkdir -p "$STATE_DIR/run"
+
+# ── Output ──────────────────────────────────────────────────
+# Plugin actions run without a TTY; stdout/stderr end up in `herdr plugin log list`.
+# Everything is also appended to $LOG so key-binding runs can be inspected later.
+say() {
+  printf 'devlayout: %s\n' "$1"
+  printf '%s %s\n' "$(date '+%F %T')" "$1" >>"$LOG" 2>/dev/null || :
+}
+die() { say "error: $1" >&2; notify "devlayout: error" "$1"; exit 1; }
+
+# Runs from a key binding, a plugin action or a hook have no screen, so their messages would only reach
+# the log. Show errors and skipped roles as a herdr notification there. With DEVLAYOUT_NOTIFY=auto
+# this happens only when stderr is not a terminal; run from a pane shell, the message is already visible.
+# Never fails: a missing client or a failing herdr must not change the result. $1=title $2=body
+notify() {
+  case ${DEVLAYOUT_NOTIFY:-auto} in
+    off) return 0 ;;
+    on) ;;
+    *) if [ -t 2 ]; then return 0; fi ;;
+  esac
+  _nb=$(printf '%s' "$2" | awk '{ b = b (NR > 1 ? " " : "") $0 } END { print substr(b, 1, 300) }')
+  "$HERDR" notification show "$1" --body "$_nb" >/dev/null 2>&1 || :
+}
+notify_skipped() {
+  if [ -n "$SKIPPED" ]; then
+    notify "devlayout: skipped" "Not started:$SKIPPED. Something else is running in those panes; quit it and run open again"
+  fi
+}
+if [ "${DEVLAYOUT_DEBUG:-}" = 1 ]; then set -x; fi
+
+# ── Small helpers ───────────────────────────────────────────
+# Call herdr; on failure show herdr's own error text and exit
+h() { _o=$("$HERDR" "$@" 2>&1) || die "herdr $* failed: $_o"; printf '%s\n' "$_o"; }
+# Quote a string for the shell with single quotes
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+now() { date +%s; }
+
+# ── Preconditions ───────────────────────────────────────────
+require_herdr() {
+  command -v "$HERDR" >/dev/null 2>&1 || die "herdr not found. Check your PATH"
+  command -v jq >/dev/null 2>&1 || die "jq is required. Install it (brew install jq / apt install jq)"
+  # Run from a terminal outside herdr, the layout would be built in a detached server you can't see.
+  # herdr panes, key bindings and plugin actions all have HERDR_ENV=1 or HERDR_ACTIVE_PANE_ID.
+  if [ "${HERDR_ENV:-}" != 1 ] && [ -z "${HERDR_ACTIVE_PANE_ID:-}" ]; then
+    die "run this inside herdr: from a herdr pane, a herdr key binding or the plugin action"
+  fi
+}
+
+# One run per project at a time (e.g. a repeated key press). A lock older than 2 minutes is treated as stale.
+# try_lock returns 1 if the lock is held; lock exits with an error instead.
+try_lock() {
+  _lock=$STATE_DIR/run/$1.lock
+  if ! mkdir "$_lock" 2>/dev/null; then
+    [ -n "$(find "$_lock" -prune -mmin +2 2>/dev/null)" ] || return 1
+    rmdir "$_lock" 2>/dev/null || :
+    mkdir "$_lock" 2>/dev/null || return 1
+  fi
+  trap 'rmdir "$_lock" 2>/dev/null || :' EXIT
+  trap 'exit 130' INT TERM
+}
+lock() {
+  try_lock "$1" || die "another devlayout run for '$1' is in progress. Try again in a moment (stale locks expire after 2 minutes)"
+}
+
+# ── herdr queries ───────────────────────────────────────────
+# Every command works on a single tab (the one holding the current pane); other tabs are never
+# counted or closed. An unfiltered `pane list` returns all panes with their tab_id (herdr 0.9.5).
+panes() { h pane list | jq -c --arg t "$1" '[.. | objects | select(has("pane_id") and .tab_id? == $t)] | unique_by(.pane_id) | .[]'; }
+pane_info() { h pane get "$1" | jq -c --arg p "$1" '[.. | objects | select(.pane_id? == $p)] | first // {}'; }
+# Find a pane by label
+pane_by_label() { panes "$1" | jq -r --arg l "$2" 'select(.label == $l) | .pane_id' | head -n1; }
+# Sort pane ids from stdin in creation order ($1=-r for reverse). Ids are never reused, so number order
+# is creation order. herdr 0.9.5 writes the number as base 32 with digits 1..9, A..Z (no I L O U), 0
+# meaning 1..32 (observed: p9 -> pA, pZ -> p0 -> p11). The old "w64e...-3" form ends in a decimal number.
+sort_ids() {
+  awk '{
+    n = 0
+    if (match($0, /:p[0-9A-Z]+$/)) {
+      s = substr($0, RSTART + 2)
+      for (i = 1; i <= length(s); i++) n = n * 32 + index("123456789ABCDEFGHJKMNPQRSTVWXYZ0", substr(s, i, 1))
+    } else { s = $0; sub(/.*[^0-9]/, "", s); n = s + 0 }
+    print n "\t" $0
+  }' | sort -n ${1:+"$1"} | cut -f2
+}
+panes_by_number() { panes "$1" | jq -r '.pane_id' | sort_ids; }
+
+# The current pane: key binding (HERDR_ACTIVE_PANE_ID) -> plugin action / pane shell (HERDR_PANE_ID)
+# -> the focused pane in the list
+current_pane() {
+  for _p in "${HERDR_ACTIVE_PANE_ID:-}" "${HERDR_PANE_ID:-}"; do
+    if [ -n "$_p" ]; then printf '%s\n' "$_p"; return; fi
+  done
+  h pane list | jq -r '[.. | objects | select(has("pane_id") and .focused? == true) | .pane_id] | first // empty'
+}
+
+# Tab id of the current pane
+current_tab() {
+  _cur=$(current_pane)
+  [ -n "$_cur" ] || die "could not find the current pane. Run this from a herdr pane, key binding or plugin action"
+  _t=$(pane_info "$_cur" | jq -r '.tab_id // empty')
+  [ -n "$_t" ] || die "could not find the current tab (no tab_id in herdr pane get $_cur). Check your herdr version"
+  printf '%s\n' "$_t"
+}
+
+# Directory -> project root (git top level, otherwise the directory itself)
+root_of() { git -C "$1" rev-parse --show-toplevel 2>/dev/null || (cd "$1" && pwd -P); }
+
+# Project root -> state key "<first 40 chars of folder name>-<CRC32 of the path, 8 hex>".
+# Used for pid, cooldown, lock and nvim socket file names, so same-named folders at different paths
+# never collide. The name is cut to 40 chars for the socket path limit (104 bytes on macOS).
+proj_key() {
+  printf '%s-%s\n' "$(basename "$1" | awk '{ print substr($0, 1, 40) }')" \
+    "$(printf '%s' "$1" | cksum | awk '{ printf "%08x", $1 }')"
+}
+
+# Project root of a tab, from the working directory of the agent pane (or the first pane). $1=tab
+tab_root() {
+  _a=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_AGENT")
+  [ -n "$_a" ] || _a=$(panes_by_number "$1" | head -n1)
+  _cwd=$(pane_info "$_a" | jq -r '.cwd // empty')
+  if [ -z "$_cwd" ] || [ ! -d "$_cwd" ]; then
+    # A plugin action runs in the plugin folder, so $PWD is only meaningful when run from a shell
+    if [ -n "${HERDR_ACTIVE_PANE_CWD:-}" ]; then _cwd=$HERDR_ACTIVE_PANE_CWD
+    elif [ -z "${HERDR_PLUGIN_ROOT:-}" ]; then _cwd=$PWD
+    else die "unknown working directory for tab $1 (no cwd in herdr pane get)"; fi
+  fi
+  root_of "$_cwd"
+}
+
+# ── Program state ───────────────────────────────────────────
+# After a herdr server restart, panes, layout and labels come back but programs start as plain shells.
+# So for each role (agent/editor/review) we check whether it really runs and restart only stopped ones.
+#   - Each program is started as `sh -c 'echo $$ > pidfile; exec cmd'`, leaving its pid behind.
+#   - Running = the pid is alive and its process name matches the command (guards against pid reuse).
+#   - For the agent, herdr's agent detection (pane_info.agent) counts too.
+#   - Started within COOLDOWN seconds counts as running (so a repeated key press types nothing).
+pidf() { printf '%s/run/%s.%s.pid\n' "$STATE_DIR" "$1" "$2"; }     # $1=project key $2=role
+mark() { printf '%s/run/%s.%s.started\n' "$STATE_DIR" "$1" "$2"; }
+
+recently_started() {
+  _m=$(mark "$1" "$2")
+  [ -f "$_m" ] || return 1
+  _t=$(cat "$_m" 2>/dev/null || echo 0)
+  [ $(( $(now) - _t )) -lt "$DEVLAYOUT_COOLDOWN" ]
+}
+
+# $1=key $2=role $3=expected process name (empty: skip the name check)
+pid_alive() {
+  _f=$(pidf "$1" "$2")
+  [ -f "$_f" ] || return 1
+  _pid=$(cat "$_f" 2>/dev/null) || return 1
+  case $_pid in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_pid" 2>/dev/null || return 1
+  [ -z "${3:-}" ] && return 0
+  _comm=$(ps -p "$_pid" -o comm= 2>/dev/null | sed 's|.*/||') || return 1
+  [ -n "$_comm" ] || return 1
+  # Linux truncates comm to 15 chars, so a prefix match either way counts
+  case $_comm in "$3"*) return 0 ;; esac
+  case $3 in "$_comm"*) return 0 ;; esac
+  return 1
+}
+
+# shellcheck disable=SC2086  # word splitting is intended
+first_word() { set -f; set -- $1; set +f; printf '%s' "${1##*/}"; }   # first word of a command, without its path
+
+agent_alive() {   # $1=key $2=pane
+  recently_started "$1" agent && return 0
+  [ "$(pane_info "$2" | jq -r '.agent // empty')" = "$DEVLAYOUT_AGENT_NAME" ] && return 0
+  pid_alive "$1" agent ""    # the resume command runs under sh, so skip the name check
+}
+editor_alive() { recently_started "$1" editor || pid_alive "$1" editor "$(editor_procname)"; }
+review_alive() { recently_started "$1" review || pid_alive "$1" review "$(first_word "$DEVLAYOUT_REVIEW_CMD")"; }
+
+# ── Before typing: is the shell in the foreground? ─────────
+# Even if the running check above is wrong (nvim/less started by hand, Claude not yet detected, ...),
+# never type a command into a running program: ask herdr for the foreground process right before
+# typing. The shell is in front when foreground_process_group_id == shell_pid (0.9.5).
+# Prints "shell" | "busy <program name>" | "unknown" (query failed or shell not started yet).
+fg_state() {
+  _fs=$("$HERDR" pane process-info --pane "$1" 2>/dev/null | jq -r '
+    (.result.process_info // {}) as $i
+    | if ($i.shell_pid | type) != "number" then "unknown"
+      elif $i.foreground_process_group_id == $i.shell_pid then "shell"
+      else ([$i.foreground_processes[]? | select(.pid == $i.foreground_process_group_id)] + [$i.foreground_processes[]?])
+           | (first // {}) | (.argv0 // .name // "?") | sub("^.*/"; "") | "busy " + .
+      end' 2>/dev/null) || _fs=
+  printf '%s\n' "${_fs:-unknown}"
+}
+
+# Returns 0 only when the shell is in front. If unknown, wait up to SHELL_WAIT seconds; if another
+# program is in front, skip right away. Exception: a pane we just created (FRESH) cannot hold a user
+# program, and while a shell initialises a child process may briefly be in front (seen with zsh on
+# 0.9.5), so wait for those too. Skipped roles are collected in SKIPPED. $1=pane $2=role
+FRESH=
+shell_ready() {
+  _wi=0
+  while :; do
+    _fs=$(fg_state "$1")
+    case $_fs in
+      shell) return 0 ;;
+      busy\ *)
+        case " $FRESH " in
+          *" $1 "*) ;;   # new pane: keep waiting
+          *) SKIPPED="$SKIPPED $2(${_fs#busy })"
+             say "$2 pane ($1) is running ${_fs#busy }; not typing into it. Leave it if you started it yourself, otherwise quit it and run open again"
+             return 1 ;;
+        esac ;;
+    esac
+    [ "$_wi" -lt "$DEVLAYOUT_SHELL_WAIT" ] || break
+    sleep 1
+    _wi=$((_wi + 1))
+  done
+  SKIPPED="$SKIPPED $2(?)"
+  say "could not confirm a shell prompt in the $2 pane ($1); not typing into it (check: herdr pane process-info --pane $1)"
+  return 1
+}
+
+# ── Starting programs ───────────────────────────────────────
+# Type `sh -c '...'` into the pane's shell, so the syntax is the same for zsh, bash and fish.
+# Note: aliases and shell functions of the user's shell are not available inside sh -c (see README).
+# Returns 1 without typing if the shell is not in front. $1=pane $2=role $3=shell code
+run_in() {
+  shell_ready "$1" "$2" || return 1
+  h pane run "$1" "sh -c $(shq "$3")" >/dev/null
+}
+
+# $1=pane $2=key $3=role $4=shell code (must end with exec so the pid file holds the program's pid).
+# Leaves no cooldown mark when nothing was typed, so the next run decides again.
+start_role() {
+  run_in "$1" "$3" "echo \$\$ > $(shq "$(pidf "$2" "$3")"); $4" || return 1
+  now >"$(mark "$2" "$3")"
+}
+
+sock_of() { printf '%s/%s.sock\n' "$DEVLAYOUT_SOCKET_DIR" "$1"; }
+
+editor_procname() {   # editor process name, for the running check
+  if [ -n "$DEVLAYOUT_EDITOR_CMD" ]; then first_word "$DEVLAYOUT_EDITOR_CMD"; else first_word "$DEVLAYOUT_EDITOR"; fi
+}
+
+editor_cmd() {   # $1=key -> shell code that starts the editor (ends with exec)
+  if [ -n "$DEVLAYOUT_EDITOR_CMD" ]; then printf 'exec %s' "$DEVLAYOUT_EDITOR_CMD"; return; fi
+  if [ "$DEVLAYOUT_EDITOR" = nvim ]; then
+    _s=$(shq "$(sock_of "$1")")
+    # A dead socket file makes --listen fail, so remove it. A live socket is left alone.
+    printf 'mkdir -p %s; if [ -S %s ] && ! nvim --headless --server %s --remote-expr 1 >/dev/null 2>&1; then rm -f %s; fi; exec nvim --listen %s' \
+      "$(shq "$DEVLAYOUT_SOCKET_DIR")" "$_s" "$_s" "$_s" "$_s"
+  else
+    printf 'exec %s' "$DEVLAYOUT_EDITOR"
+  fi
+}
+
+start_editor() { start_role "$1" "$2" editor "$(editor_cmd "$2")"; }
+start_review() { start_role "$1" "$2" review "exec $DEVLAYOUT_REVIEW_CMD"; }
+
+# Age of a process in seconds, from `ps -o etime=` ([[DD-]HH:]MM:SS). Empty if unknown.
+proc_age() {
+  ps -p "$1" -o etime= 2>/dev/null | awk 'NF {
+    s = $1; d = 0
+    if (index(s, "-")) { split(s, a, "-"); d = a[1]; s = a[2] }
+    n = split(s, b, ":"); t = 0
+    for (i = 1; i <= n; i++) t = t * 60 + b[i]
+    print d * 86400 + t
+  }'
+}
+
+# herdr's resume_agents_on_restore types `claude --resume <id>` into a pane as soon as it spawns, before
+# its shell is ready (seen on 0.9.5). A shell check made in that moment still sees the shell, and
+# whatever we type would land in the resumed agent. So if the agent pane's shell is younger than
+# AGENT_SETTLE seconds, wait until it is that old; by then a resumed agent is in front and gets skipped.
+settle_agent_pane() {
+  _sp=$("$HERDR" pane process-info --pane "$1" 2>/dev/null | jq -r '.result.process_info.shell_pid // empty' 2>/dev/null) || _sp=
+  [ -n "$_sp" ] || return 0
+  _age=$(proc_age "$_sp")
+  case $_age in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$_age" -lt "$DEVLAYOUT_AGENT_SETTLE" ]; then sleep $((DEVLAYOUT_AGENT_SETTLE - _age)); fi
+}
+
+# $1=pane $2=key $3=new|resume
+start_agent() {
+  if [ "$3" = resume ]; then
+    # If resuming fails within GRACE seconds (nothing to resume, ...), start a new session.
+    # An agent that exits later (the user quit it) is not started again.
+    _c="s=\$(date +%s); $DEVLAYOUT_AGENT_RESUME_CMD || { [ \$(( \$(date +%s) - s )) -lt $DEVLAYOUT_RESUME_GRACE ] && exec $DEVLAYOUT_AGENT_CMD; }"
+  else
+    _c="exec $DEVLAYOUT_AGENT_CMD"
+  fi
+  settle_agent_pane "$1"
+  # The agent may not be exec'd, so the pid is that of sh (sh alive = agent running)
+  run_in "$1" agent "echo \$\$ > $(shq "$(pidf "$2" agent)"); $_c" || return 1
+  now >"$(mark "$2" agent)"
+}
+
+# ── Layout ──────────────────────────────────────────────────
+split() {   # $1=pane to split $2=right|down $3=cwd -> new pane id
+  _id=$(h pane split "$1" --direction "$2" --cwd "$3" --no-focus | jq -r '.result.pane.pane_id // empty')   # holds only the new pane (0.9.5)
+  [ -n "$_id" ] || die "no pane_id in the output of herdr pane split (output format changed? check your herdr version)"
+  printf '%s\n' "$_id"
+}
+
+label3() {   # $1=agent $2=editor $3=review
+  h pane rename "$1" "$DEVLAYOUT_LABEL_AGENT" >/dev/null
+  h pane rename "$2" "$DEVLAYOUT_LABEL_EDITOR" >/dev/null
+  h pane rename "$3" "$DEVLAYOUT_LABEL_REVIEW" >/dev/null
+}
+
+# Build the 3-pane layout. $1=agent pane $2=root $3=key $4=new|resume
+build() {
+  _rev=$(split "$1" right "$2")   # split right first so review gets the full height
+  _ed=$(split "$1" down "$2")     # bottom left
+  label3 "$1" "$_ed" "$_rev"
+  SKIPPED=; FRESH="$FRESH $_ed $_rev"
+  start_editor "$_ed" "$3" || :
+  start_review "$_rev" "$3" || :
+  if agent_alive "$3" "$1"; then :; else start_agent "$1" "$3" "$4" || :; fi
+  _sk=; if [ -n "$SKIPPED" ]; then _sk=" · skipped:$SKIPPED"; fi
+  say "layout ready ($DEVLAYOUT_LABEL_AGENT $1 · $DEVLAYOUT_LABEL_EDITOR $_ed · $DEVLAYOUT_LABEL_REVIEW $_rev)$_sk"
+  notify_skipped
+}
+
+# Find the role panes of a tab that already has 3 panes -> sets A E R. $1=tab
+# Without labels, assign roles by creation order (agent, review, editor) and label them again.
+map3() {
+  A=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_AGENT")
+  E=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_EDITOR")
+  R=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_REVIEW")
+  if [ -z "$A" ] || [ -z "$E" ] || [ -z "$R" ]; then
+    # shellcheck disable=SC2046
+    set -- $(panes_by_number "$1")
+    A=$1; R=$2; E=$3
+    label3 "$A" "$E" "$R"
+    say "panes had no labels; assigned roles by creation order ($DEVLAYOUT_LABEL_AGENT $A · $DEVLAYOUT_LABEL_REVIEW $R · $DEVLAYOUT_LABEL_EDITOR $E)"
+  fi
+}
+
+# Restart only the stopped programs. $1=key $2=roles (default "agent editor review"); A E R from map3
+ensure() {
+  _done=; SKIPPED=; _roles=" ${2:-agent editor review} "
+  case $_roles in *" agent "*)
+    if ! agent_alive "$1" "$A"; then if start_agent "$A" "$1" resume; then _done="$_done agent"; fi; fi ;; esac
+  case $_roles in *" editor "*)
+    if ! editor_alive "$1"; then if start_editor "$E" "$1"; then _done="$_done editor"; fi; fi ;; esac
+  case $_roles in *" review "*)
+    if ! review_alive "$1"; then if start_review "$R" "$1"; then _done="$_done review"; fi; fi ;; esac
+  if [ -n "$_done" ] && [ -n "$SKIPPED" ]; then say "restarted:$_done · skipped:$SKIPPED"
+  elif [ -n "$_done" ]; then say "restarted:$_done"
+  elif [ -n "$SKIPPED" ]; then say "skipped:$SKIPPED"
+  else say "all three programs are running"; fi
+  notify_skipped
+}
+
+# Build or repair a tab depending on its state. $1=tab $2=root (optional)
+build_or_repair() {
+  _tab=$1
+  _root=${2:-$(tab_root "$_tab")}
+  _name=$(basename "$_root")
+  _key=$(proj_key "$_root")
+  lock "$_key"
+  _count=$(panes "$_tab" | jq -s 'length')
+  case $_count in
+    1) say "building the layout in the '$_name' tab (1 pane)"
+       build "$(panes_by_number "$_tab")" "$_root" "$_key" new ;;
+    3) map3 "$_tab"
+       say "the '$_name' tab already has the layout; checking for stopped programs"
+       ensure "$_key" ;;
+    *) die "the current '$_name' tab has $_count panes (other tabs are not counted). Run reset to restore the 3-pane layout" ;;
+  esac
+}
+
+# ── Commands ────────────────────────────────────────────────
+cmd_open() {
+  require_herdr
+  if [ -z "${1:-}" ]; then
+    build_or_repair "$(current_tab)"
+    return
+  fi
+
+  [ -d "$1" ] || die "no such directory: $1"
+  _root=$(root_of "$1")
+  _name=$(basename "$_root")
+  # If a workspace with this name exists, work on its active tab
+  _wsj=$(h workspace list | jq -c --arg n "$_name" '[.. | objects | select(has("workspace_id") and .label? == $n)] | first // empty')
+  if [ -n "$_wsj" ]; then
+    _ws=$(printf '%s\n' "$_wsj" | jq -r '.workspace_id')
+    _tab=$(printf '%s\n' "$_wsj" | jq -r '.active_tab_id // empty')
+    [ -n "$_tab" ] || die "could not find the active tab of workspace $_ws (no active_tab_id in herdr workspace list). Switch to that workspace and run open there"
+    h workspace focus "$_ws" >/dev/null
+    build_or_repair "$_tab" "$_root"
+    return
+  fi
+
+  _key=$(proj_key "$_root")
+  lock "$_key"
+  _out=$(h workspace create --cwd "$_root" --label "$_name" --focus)
+  _agent=$(printf '%s\n' "$_out" | jq -r '.result.root_pane.pane_id // empty')
+  [ -n "$_agent" ] || die "no pane_id in the output of herdr workspace create (output format changed? check your herdr version)"
+  say "created workspace '$_name' ($_root)"
+  build "$_agent" "$_root" "$_key" new
+}
+
+cmd_reset() {
+  require_herdr
+  _tab=$(current_tab)
+  _root=$(tab_root "$_tab")
+  _key=$(proj_key "$_root")
+  lock "$_key"
+
+  # The agent pane to keep, within this tab: label -> agent detection -> first pane
+  _keep=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_AGENT")
+  [ -n "$_keep" ] || _keep=$(panes "$_tab" | jq -r --arg a "$DEVLAYOUT_AGENT_NAME" 'select(.agent == $a) | .pane_id' | head -n1)
+  [ -n "$_keep" ] || _keep=$(panes_by_number "$_tab" | head -n1)
+  [ -n "$_keep" ] || die "no panes found in tab $_tab"
+  h pane rename "$_keep" "$DEVLAYOUT_LABEL_AGENT" >/dev/null   # found again by label after closing
+  say "resetting tab $_tab"
+
+  # Save editor buffers (only if the nvim socket answers)
+  if [ "$DEVLAYOUT_EDITOR" = nvim ] && command -v nvim >/dev/null 2>&1; then
+    _s=$(sock_of "$_key")
+    if [ -S "$_s" ] && nvim --headless --server "$_s" --remote-expr 1 >/dev/null 2>&1; then
+      nvim --headless --server "$_s" --remote-send '<C-\><C-N>:wa<CR>' >/dev/null 2>&1 || :
+    fi
+  fi
+
+  # Close the other panes of this tab, newest first (other tabs untouched)
+  for _p in $(panes "$_tab" | jq -r --arg k "$_keep" 'select(.pane_id != $k) | .pane_id' | sort_ids -r); do
+    h pane close "$_p" >/dev/null
+  done
+  rm -f "$(mark "$_key" editor)" "$(mark "$_key" review)"
+
+  _keep=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_AGENT")
+  [ -n "$_keep" ] || die "lost the $DEVLAYOUT_LABEL_AGENT pane after closing the others. Check with status and tidy up the remaining panes by hand"
+  build "$_keep" "$_root" "$_key" resume
+}
+
+cmd_status() {
+  require_herdr
+  _tab=$(current_tab)
+  _root=$(tab_root "$_tab")
+  _name=$(basename "$_root")
+  _key=$(proj_key "$_root")
+  printf 'tab:     %s\nproject: %s (%s)\nkey:     %s\n' "$_tab" "$_name" "$_root" "$_key"
+  panes "$_tab" | jq -r '"pane \(.pane_id)  label=\(.label // "-")  agent=\(.agent // "-")  cwd=\(.cwd // "-")"'
+  for _r in agent editor review; do
+    case $_r in
+      agent)  _p=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_AGENT"); if [ -n "$_p" ] && agent_alive "$_key" "$_p"; then _st=running; else _st=stopped; fi ;;
+      editor) _p=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_EDITOR"); if editor_alive "$_key"; then _st=running; else _st=stopped; fi ;;
+      review) _p=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_REVIEW"); if review_alive "$_key"; then _st=running; else _st=stopped; fi ;;
+    esac
+    # For a stopped role, show what is in front (e.g. a program started by hand that blocks a restart)
+    _fg=; if [ "$_st" = stopped ] && [ -n "$_p" ]; then _f=$(fg_state "$_p"); case $_f in busy\ *) _fg=" (foreground: ${_f#busy })" ;; esac; fi
+    printf '%-7s %s%s\n' "$_r" "$_st" "$_fg"
+  done
+}
+
+# Repair a tab only if it has our layout (3 panes with the three labels); otherwise return 2 and change
+# nothing. Call it in a subshell so die and the lock release stay within that tab. $1=tab $2=roles
+repair_tab() {
+  [ "$(panes "$1" | jq -s 'length')" = 3 ] || return 2
+  A=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_AGENT")
+  E=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_EDITOR")
+  R=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_REVIEW")
+  { [ -n "$A" ] && [ -n "$E" ] && [ -n "$R" ]; } || return 2
+  _root=$(tab_root "$1")
+  _key=$(proj_key "$_root")
+  lock "$_key"
+  # Right after a server start every shell is new and may briefly have a child in front -> wait
+  FRESH="$A $E $R"
+  say "tab $1 ($(basename "$_root")):"
+  ensure "$_key" "$2"
+}
+
+# Repair every tab, in every workspace, that has our layout. Never builds, guesses labels or resets.
+# The agent is excluded by default: herdr's resume_agents_on_restore resumes it, and two parties must
+# not type into the same pane.
+cmd_repair_all() {
+  require_herdr
+  _roles="editor review"
+  if [ "$DEVLAYOUT_STARTUP_AGENT" = 1 ]; then _roles="agent editor review"; fi
+  _n=0
+  for _t in $(h pane list | jq -r '[.. | objects | select(has("pane_id")) | .tab_id? // empty] | unique | .[]'); do
+    _rc=0
+    ( repair_tab "$_t" "$_roles" ) || _rc=$?
+    case $_rc in
+      0) _n=$((_n + 1)) ;;
+      2) ;;
+      *) _n=$((_n + 1)); say "tab $_t: repair failed (see the message above)" ;;
+    esac
+  done
+  say "repair-all: $_n tab(s) with the devlayout layout checked"
+}
+
+# herdr [[startup]] hook. Off by default, so installing alone never types into panes at server start
+cmd_startup() {
+  if [ "$DEVLAYOUT_STARTUP" != 1 ]; then
+    say "startup repair is off (set DEVLAYOUT_STARTUP=1 in config.env to enable)"
+    return 0
+  fi
+  cmd_repair_all
+}
+
+# herdr [[events]] hook for worktree.created and worktree.opened. Off by default (DEVLAYOUT_WORKTREE=1).
+# Builds the layout in the new worktree workspace only when its tab has exactly one pane; anything else
+# is left alone. Both events may fire at the same time for one workspace: the second one finds the lock
+# held or the layout already built and exits quietly.
+evq() { printf '%s\n' "$_ev" | jq -r "$1 // empty" 2>/dev/null || :; }
+cmd_worktree_event() {
+  [ "$DEVLAYOUT_WORKTREE" = 1 ] || return 0
+  require_herdr
+  _ev=${HERDR_PLUGIN_EVENT_JSON:-}
+  if [ -z "$_ev" ] || ! printf '%s\n' "$_ev" | jq -e . >/dev/null 2>&1; then
+    say "worktree-event: no usable event payload (HERDR_PLUGIN_EVENT_JSON); it only runs from herdr's [[events]] hook"
+    return 0
+  fi
+  # worktree.opened for a workspace that was already open is not a new workspace
+  if [ "$(evq .data.already_open)" = true ]; then return 0; fi
+  _ws=$(evq '.data.workspace.workspace_id // .data.worktree.open_workspace_id')
+  if [ -z "$_ws" ]; then say "worktree-event: no workspace id in the event payload"; return 0; fi
+  _tab=$(evq .data.workspace.active_tab_id)
+  if [ -z "$_tab" ]; then
+    _tab=$(h workspace get "$_ws" | jq -r '[.. | objects | .active_tab_id? // empty] | first // empty')
+  fi
+  if [ -z "$_tab" ]; then say "worktree-event: could not find the active tab of workspace $_ws"; return 0; fi
+  _path=$(evq '.data.worktree.path // .data.workspace.worktree.checkout_path')
+  if [ -n "$_path" ] && [ -d "$_path" ]; then _root=$(root_of "$_path"); else _root=$(tab_root "$_tab"); fi
+  _name=$(basename "$_root")
+  _key=$(proj_key "$_root")
+  try_lock "$_key" || return 0
+  _count=$(panes "$_tab" | jq -s 'length')
+  case $_count in
+    1) _a=$(panes_by_number "$_tab")
+       FRESH=$_a   # the root pane of a brand-new workspace: its shell may still be starting
+       say "worktree '$_name': building the layout in tab $_tab"
+       build "$_a" "$_root" "$_key" new ;;
+    3) ;;   # already built (the other event got here first)
+    *) _m="worktree '$_name': tab $_tab has $_count panes; not building. If reviewr opened its own pane there, set auto_open = false in reviewr's config.toml"
+       say "$_m"
+       notify "devlayout: worktree layout not built" "$_m" ;;
+  esac
+}
+
+cmd_editor_socket() { sock_of "$(proj_key "$(root_of "${1:-$PWD}")")"; }
+
+# For reviewr's editor setting: open in the resident nvim if there is one, otherwise in this pane
+cmd_open_file() {
+  [ -n "${1:-}" ] || die "usage: devlayout open-file FILE [LINE]"
+  _file=$1; _line=${2:-1}
+  case $_line in ''|*[!0-9]*) _line=1 ;; esac
+  case $_file in /*) ;; *) _file=$PWD/$_file ;; esac
+  _s=$(sock_of "$(proj_key "$(root_of "$(dirname "$_file")")")")
+  # --headless: reviewr hands its terminal to this command, and with a terminal attached an nvim client
+  # starts a TUI whose escape codes would end up in $_esc and be sent to the editor as keys
+  if [ -S "$_s" ] && nvim --headless --server "$_s" --remote-expr 1 >/dev/null 2>&1; then
+    # fnameescape keeps paths with spaces and special characters safe
+    _esc=$(nvim --headless --server "$_s" --remote-expr "fnameescape('$(printf '%s' "$_file" | sed "s/'/''/g")')")
+    nvim --headless --server "$_s" --remote-send "<C-\\><C-N>:drop $_esc<CR>:$_line<CR>zz"
+  else
+    exec nvim "+$_line" "$_file"
+  fi
+}
+
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  _cmd=${1:-open}
+  [ $# -gt 0 ] && shift
+  case $_cmd in
+    open)                 cmd_open "${1:-}" ;;
+    reset|--reset|-r)     cmd_reset ;;
+    status)               cmd_status ;;
+    repair-all)           cmd_repair_all ;;
+    startup)              cmd_startup ;;
+    worktree-event)       cmd_worktree_event ;;
+    open-file)            cmd_open_file "$@" ;;
+    editor-socket)        cmd_editor_socket "${1:-}" ;;
+    help|-h|--help)       usage ;;
+    version|--version)    printf 'devlayout %s\n' "$VERSION" ;;
+    -*)                   die "unknown option: $_cmd (see devlayout help)" ;;
+    *)  if [ -d "$_cmd" ]; then cmd_open "$_cmd"
+        else die "unknown command or no such directory: $_cmd (see devlayout help)"; fi ;;
+  esac
+}
+
+main "$@"

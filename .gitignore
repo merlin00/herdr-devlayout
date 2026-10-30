@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+/tmp/
+# private development notes (kept in a separate private repository)
+/.internal/
+/CLAUDE.md
