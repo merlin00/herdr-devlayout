@@ -1,6 +1,6 @@
 ---
 name: devlayout
-description: Guide the user to the right pane of a herdr devlayout tab (agent | editor nvim / review). Use when running inside herdr (HERDR_ENV=1) in a devlayout tab and you want the user to read a result or file (show it in a file viewer popup), to edit a long text themselves (open it in the editor pane's nvim), or when the layout looks broken. Do not use outside herdr.
+description: Guide the user to the right pane of a herdr devlayout tab (agent | editor nvim / review). Use when running inside herdr (HERDR_ENV=1) in a devlayout tab and you want the user to read a result or file (show it in a file viewer popup), to edit a long text themselves (open it in the editor pane's nvim), to review your code changes (focus the review pane), or when the layout looks broken. Do not use outside herdr.
 ---
 
 # devlayout
@@ -9,7 +9,7 @@ The user works in a herdr tab with three panes: you (the agent) top left, nvim (
 and a review pane on the right. `devlayout` moves the user's focus to the pane that fits the next step.
 
 Run `devlayout`. If it is not on PATH, run `sh <this skill's folder>/../../bin/devlayout` instead.
-Every command prints one line. On error it exits non-zero with the cause and the next step. If a command
+Most commands print one line (`state` prints JSON, `doctor` a report). On error a command exits non-zero with the cause and the next step. If a command
 fails because something is missing (a plugin, a program, the layout), run `devlayout doctor` and pass on
 its `missing`, `warn` and `optional` lines with their fix commands.
 
@@ -64,7 +64,29 @@ file, a draft.
 
 `edit` refuses when another program runs in the editor pane. Pass on its message; do not retry in a loop.
 
-## 4. Choices and questions
+## 4. Ask for a review of your changes: `focus review`
+
+The review pane runs reviewr: it shows the uncommitted diff, the user comments on lines, and `s` puts every
+comment into your input. Use it when you changed files and the user wants to check them before going on,
+for example after a plan step or before a commit.
+
+1. Only when there is something to review: `git status --short` lists changed files that are not git-ignored
+   (reviewr does not show ignored files).
+2. Run:
+
+   ```bash
+   devlayout focus review "Claude changed 3 files; review them in reviewr"
+   ```
+
+3. End your turn with one line: which files changed and what to look at first. Tell the user to comment
+   with `c` and send the comments with `s`. Do not wait or poll; the comments arrive as the next message.
+4. Treat each comment as a request: fix it, or answer why not.
+
+Do not move the focus to the review pane after every edit. Do it once per step, when the user asked for a
+review or a plan step is done, and not when `state` shows `review` as `stopped`, `missing` or `busy`
+(say that the review pane is not running instead; `devlayout open` restarts it).
+
+## 5. Choices and questions
 
 Ask choices in your own pane, not in a file. This plugin's hook moves the focus to your pane right before
 every question, so you do not need to. Without the hook (the skill used on its own), run
@@ -72,7 +94,7 @@ every question, so you do not need to. Without the hook (the skill used on its o
 
 `devlayout focus editor|review` moves the focus to those panes when you only want the user to look there.
 
-## 5. The layout looks wrong
+## 6. The layout looks wrong
 
 `layout` is `other`, or a role is `missing`:
 
