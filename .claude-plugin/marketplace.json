@@ -1,0 +1,15 @@
+{
+  "name": "herdr-devlayout",
+  "description": "devlayout for herdr: the agent | editor / review layout's Claude Code side (skill + question hook)",
+  "owner": {
+    "name": "merlin00"
+  },
+  "plugins": [
+    {
+      "name": "devlayout",
+      "source": "./",
+      "description": "Lets Claude guide you to the right pane of a herdr devlayout tab (skill + question hook). Needs the herdr plugin merlin00/herdr-devlayout.",
+      "version": "0.1.0"
+    }
+  ]
+}

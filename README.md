@@ -59,6 +59,15 @@ description = "dev layout: reset"
 Then `herdr server reload-config`. Check that the keys don't collide with your other bindings
 (`herdr --default-config` prints the defaults).
 
+Optional, so Claude can guide you to the right pane (see below):
+
+```sh
+herdr plugin install smarzban/herdr-file-viewer
+claude plugin install devlayout --marketplace merlin00/herdr-devlayout
+```
+
+`devlayout doctor` checks all of this and prints the command for anything missing.
+
 ## Usage
 
 | Do | How |
@@ -68,6 +77,7 @@ Then `herdr server reload-config`. Check that the keys don't collide with your o
 | Layout got messed up | `prefix+shift+l` (closes other panes in this tab; nvim buffers are saved first) |
 | New git worktree | with automatic layout on (below), `herdr worktree create` gives you the layout right away |
 | Open another project / worktree | in a herdr pane: `sh <plugin dir>/bin/devlayout open ../other-project` |
+| Not sure what is missing | `devlayout doctor` |
 | Something didn't happen | errors and skipped programs show up as a herdr notification; the full log is in `herdr plugin log list --plugin merlin00.devlayout` |
 
 Optional: link the script onto your PATH to run it from any herdr pane:
@@ -126,9 +136,9 @@ Commands an agent (or a hook) can run from its pane:
 | `devlayout edit FILE [LINE]` | open FILE in the editor pane's nvim (starting it if it was quit) and focus that pane |
 
 They only move the focus while you look at the layout tab; otherwise they show a herdr notification
-(`DEVLAYOUT_FOCUS=off` turns focus changes off). `devlayout install-skill` links the bundled Claude Code skill
-(`skills/devlayout`) into `~/.claude/skills`, so Claude knows when to use them. See the
-[guide](docs/GUIDE.md#7-let-claude-guide-you-to-the-right-pane) for hooks.
+(`DEVLAYOUT_FOCUS=off` turns focus changes off). This repository is also a Claude Code plugin: a skill that
+tells Claude when to use them, and a hook that focuses Claude's pane before every question. See the
+[guide](docs/GUIDE.md#7-let-claude-guide-you-to-the-right-pane).
 
 ## Configuration
 

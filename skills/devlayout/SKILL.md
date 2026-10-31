@@ -9,7 +9,9 @@ The user works in a herdr tab with three panes: you (the agent) top left, nvim (
 and a review pane on the right. `devlayout` moves the user's focus to the pane that fits the next step.
 
 Run `devlayout`. If it is not on PATH, run `sh <this skill's folder>/../../bin/devlayout` instead.
-Every command prints one line. On error it exits non-zero with the cause and the next step.
+Every command prints one line. On error it exits non-zero with the cause and the next step. If a command
+fails because something is missing (a plugin, a program, the layout), run `devlayout doctor` and pass on
+its `missing`, `warn` and `optional` lines with their fix commands.
 
 ## 1. Check the tab first
 
@@ -64,9 +66,9 @@ file, a draft.
 
 ## 4. Choices and questions
 
-Ask choices in your own pane, not in a file. If the user is elsewhere in this tab, run
-`devlayout focus agent "Claude has a question"` right before asking. A Claude Code hook can also do this
-for every question (see the devlayout guide).
+Ask choices in your own pane, not in a file. This plugin's hook moves the focus to your pane right before
+every question, so you do not need to. Without the hook (the skill used on its own), run
+`devlayout focus agent "Claude has a question"` right before asking.
 
 `devlayout focus editor|review` moves the focus to those panes when you only want the user to look there.
 

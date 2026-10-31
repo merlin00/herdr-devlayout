@@ -7,7 +7,7 @@ Output shapes follow the real herdr 0.9.5 CLI (checked 2026-10-30):
 Update this file when the real output changes.
 
 Supports: workspace list|create|get|focus, pane list|get|split|rename|run|close|process-info|neighbor|focus,
-          api snapshot, plugin pane open, notification show, status server
+          api snapshot, plugin list --json|pane open, notification show, status server
 The focused pane is the one with "focused": true (api snapshot reports it and its tab).
 Neighbours: state["neighbors"][pane][direction] if given, otherwise the devlayout geometry from the labels
 (claude top left, nvim bottom left, reviewr right; checked on real 0.9.5, 2026-10-31).
@@ -94,7 +94,12 @@ def main(argv):
         w = p["workspace_id"]
         nxt[w] = max(nxt.get(w, 0), num(p["pane_id"]) + 1)
     if argv[:2] == ["status", "server"]:
+        # MOCK_HERDR_VERSION sets the server version (real 0.9.5 prints "version: 0.9.5" as the 2nd line)
         print("status: running")
+        print("version: " + os.environ.get("MOCK_HERDR_VERSION", "0.9.5"))
+        return
+    if argv[:3] == ["plugin", "list", "--json"]:
+        out({"type": "plugin_list", "plugins": s.get("plugins", [])})
         return
     if not argv:
         fail("usage")

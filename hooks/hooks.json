@@ -1,0 +1,13 @@
+{
+  "description": "Focus the Claude pane of a herdr devlayout tab before Claude asks a question",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          { "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/devlayout\" hook question" }
+        ]
+      }
+    ]
+  }
+}

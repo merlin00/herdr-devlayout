@@ -19,7 +19,8 @@
 #                             (only if the user is looking at this tab; otherwise show MESSAGE as a notification)
 #   devlayout show FILE[:LINE[-END]]  Show FILE in a herdr-file-viewer popup, at LINE or the range
 #   devlayout edit FILE [LINE]        Open FILE in the editor pane's nvim and focus that pane
-#   devlayout install-skill   Link the bundled Claude Code skill into ~/.claude/skills/devlayout
+#   devlayout doctor          Check what devlayout needs (and the optional parts), with how to fix each
+#   devlayout hook question   Run by the Claude Code plugin before Claude asks a question: focus the agent pane
 #   devlayout repair-all      In every tab that has the devlayout layout, restart stopped editor/review
 #                             (and agent if DEVLAYOUT_STARTUP_AGENT=1). Never builds, relabels or closes panes
 #   devlayout startup         Run by herdr after a server restart; does repair-all if DEVLAYOUT_STARTUP=1
@@ -34,6 +35,7 @@
 set -eu
 
 VERSION=0.1.0
+MIN_HERDR=0.9.5                             # = min_herdr_version in herdr-plugin.toml
 
 # ── Paths and defaults ──────────────────────────────────────
 # When run as a plugin, herdr provides HERDR_BIN_PATH and HERDR_PLUGIN_*_DIR. Run from a pane shell
@@ -819,27 +821,92 @@ cmd_edit() {
   focus_role "$_tab" "$_ep" editor "Claude opened $(basename "$_file") in the editor pane"
 }
 
-# Link the bundled skill into Claude Code's skills folder. Never replaces something that is not a link.
-cmd_install_skill() {
-  _here=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd -P)
-  _src=
-  for _c in "${HERDR_PLUGIN_ROOT:-}" "$_here"; do
-    if [ -n "$_c" ] && [ -f "$_c/skills/devlayout/SKILL.md" ]; then _src=$_c/skills/devlayout; break; fi
+# Claude Code plugin hook (hooks/hooks.json), before Claude asks a question. Never fails and prints
+# nothing: outside herdr or in a tab without the layout it does nothing.
+cmd_hook() {
+  [ "${1:-}" = question ] || return 0
+  [ "${HERDR_ENV:-}" = 1 ] || return 0
+  command -v "$HERDR" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+  (
+    die() { exit 1; }    # no error notification from a hook
+    _tab=$(current_tab)
+    _a=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_AGENT")
+    [ -n "$_a" ] || exit 0
+    focus_role "$_tab" "$_a" agent "Claude has a question"
+  ) >/dev/null 2>&1 || :
+  return 0
+}
+
+# ── doctor ──────────────────────────────────────────────────
+# One line per check: ok | missing (required, exit 1) | warn | optional | skip, then how to fix it
+DOC_FAIL=0
+dline() {
+  printf '  %-8s %s\n' "$1" "$2"
+  if [ -n "${3:-}" ]; then printf '           -> %s\n' "$3"; fi
+  if [ "$1" = missing ]; then DOC_FAIL=1; fi
+}
+ver_ge() {   # $1 >= $2 (x.y.z)
+  awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, ".")
+    for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 0 }'
+}
+cmd_doctor() {
+  _cfg=${XDG_CONFIG_HOME:-$HOME/.config}/herdr
+  printf 'devlayout %s doctor\n\nrequired\n' "$VERSION"
+  _hok=
+  if command -v "$HERDR" >/dev/null 2>&1; then
+    _hv=$("$HERDR" status server 2>/dev/null | awk '$1 == "version:" { print $2; exit }') || _hv=
+    if [ -z "$_hv" ]; then dline missing "herdr server is not running" "start herdr: run herdr"
+    elif ver_ge "$_hv" "$MIN_HERDR"; then dline ok "herdr $_hv"; _hok=1
+    else dline missing "herdr $_hv (needs $MIN_HERDR or later)" "herdr update"; fi
+  else dline missing "herdr is not on PATH" "install herdr: https://herdr.dev"; fi
+  if command -v jq >/dev/null 2>&1; then dline ok jq
+  else dline missing "jq is not installed" "brew install jq / apt install jq"; fi
+  if [ "${HERDR_ENV:-}" = 1 ] || [ -n "${HERDR_ACTIVE_PANE_ID:-}" ]; then dline ok "running inside herdr"
+  else dline missing "not running inside herdr" "run devlayout doctor from a herdr pane"; fi
+
+  printf '\nlayout programs\n'
+  for _pc in "agent:$(first_word "$DEVLAYOUT_AGENT_CMD"):DEVLAYOUT_AGENT_CMD" \
+             "editor:$(editor_procname):DEVLAYOUT_EDITOR" \
+             "review:$(first_word "$DEVLAYOUT_REVIEW_CMD"):DEVLAYOUT_REVIEW_CMD"; do
+    _r=${_pc%%:*}; _p=${_pc#*:}; _p=${_p%%:*}; _v=${_pc##*:}
+    if command -v "$_p" >/dev/null 2>&1; then dline ok "$_r: $_p"
+    else dline warn "$_r: $_p is not on PATH" "install it, or set $_v in config.env"; fi
   done
-  # Run through a PATH link ($0 is the link): ask herdr where the plugin lives
-  if [ -z "$_src" ] && command -v "$HERDR" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-    _c=$("$HERDR" plugin list --json 2>/dev/null | jq -r --arg id "$PLUGIN_ID" '.result.plugins[]? | select(.plugin_id == $id) | .plugin_root' 2>/dev/null) || _c=
-    if [ -n "$_c" ] && [ -f "$_c/skills/devlayout/SKILL.md" ]; then _src=$_c/skills/devlayout; fi
+
+  printf '\nkey bindings\n'
+  if grep -q 'merlin00\.devlayout\.open' "$_cfg/config.toml" 2>/dev/null; then dline ok "open and reset keys in $_cfg/config.toml"
+  else dline warn "no key binding for merlin00.devlayout.open in $_cfg/config.toml" "add the [[keys.command]] blocks from the guide (step 2), then: herdr server reload-config"; fi
+
+  printf '\nreviewr opens files in the editor pane (optional)\n'
+  if command -v devlayout >/dev/null 2>&1; then dline ok "devlayout on PATH"
+  else dline optional "devlayout is not on PATH (reviewr runs it without a shell)" \
+    "ln -s \"\$(herdr plugin list --json | jq -r '.result.plugins[] | select(.plugin_id == \"$PLUGIN_ID\") | .plugin_root')/bin/devlayout\" ~/.local/bin/devlayout"; fi
+  if grep -q 'devlayout open-file' "$_cfg/plugins/config/persiyanov.reviewr/config.toml" 2>/dev/null; then dline ok "reviewr editor = devlayout open-file"
+  else dline optional "reviewr's editor is not devlayout open-file" "add to $_cfg/plugins/config/persiyanov.reviewr/config.toml: editor = \"devlayout open-file {file} {line}\""; fi
+
+  printf '\nClaude guides you to the right pane (optional)\n'
+  if [ -n "$_hok" ] && command -v jq >/dev/null 2>&1; then
+    if "$HERDR" plugin list --json 2>/dev/null | jq -e --arg id "$DEVLAYOUT_VIEWER" '.result.plugins[]? | select(.plugin_id == $id)' >/dev/null 2>&1; then
+      dline ok "file viewer: $DEVLAYOUT_VIEWER"
+    else dline optional "file viewer $DEVLAYOUT_VIEWER is not installed (for devlayout show)" "herdr plugin install smarzban/herdr-file-viewer"; fi
   fi
-  [ -n "$_src" ] || die "could not find the bundled skill (skills/devlayout/SKILL.md). Run it from the plugin folder: sh bin/devlayout install-skill"
-  _dst=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/devlayout
-  if [ -e "$_dst" ] && [ ! -L "$_dst" ]; then
-    die "$_dst already exists and is not a link. Move it away first, then run install-skill again"
+  if ! command -v claude >/dev/null 2>&1; then dline skip "claude is not on PATH; Claude Code plugin not checked"
+  elif ! command -v jq >/dev/null 2>&1; then :
+  else
+    _cp=$(claude plugin list --json 2>/dev/null | jq -c '[.[]? | select(.id | startswith("devlayout@"))] | first // empty' 2>/dev/null) || _cp=
+    if [ -z "$_cp" ]; then
+      dline optional "Claude Code plugin devlayout is not installed (skill + question hook)" "claude plugin install devlayout --marketplace merlin00/herdr-devlayout"
+    else
+      _cid=$(printf '%s' "$_cp" | jq -r .id); _cv=$(printf '%s' "$_cp" | jq -r '.version // "?"')
+      if [ "$(printf '%s' "$_cp" | jq -r '.enabled')" != true ]; then dline warn "Claude Code plugin $_cid is disabled" "claude plugin enable $_cid"
+      elif [ "$_cv" != "$VERSION" ]; then dline warn "Claude Code plugin $_cid is $_cv, this devlayout is $VERSION" "update the older one: claude plugin update $_cid / herdr plugin update $PLUGIN_ID"
+      else dline ok "Claude Code plugin $_cid $_cv"; fi
+    fi
   fi
-  mkdir -p "$(dirname "$_dst")"
-  rm -f "$_dst"
-  ln -s "$_src" "$_dst"
-  say "linked the Claude Code skill: $_dst -> $_src (start a new Claude session to load it)"
+  printf '\n'
+  if [ "$DOC_FAIL" = 1 ]; then say "something required is missing (see above)"; exit 1; fi
+  say "required parts are in place"
 }
 
 usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -860,7 +927,8 @@ main() {
     focus)                cmd_focus "$@" ;;
     show)                 cmd_show "$@" ;;
     edit)                 cmd_edit "$@" ;;
-    install-skill)        cmd_install_skill ;;
+    doctor)               cmd_doctor ;;
+    hook)                 cmd_hook "${1:-}" ;;
     help|-h|--help)       usage ;;
     version|--version)    printf 'devlayout %s\n' "$VERSION" ;;
     -*)                   die "unknown option: $_cmd (see devlayout help)" ;;

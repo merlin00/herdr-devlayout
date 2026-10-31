@@ -25,5 +25,8 @@ First release. Requires herdr 0.9.5 or later (macOS, Linux).
 - For agents: `state` (the tab as JSON), `focus agent|editor|review`, `show FILE[:LINE[-END]]` (a
   herdr-file-viewer popup) and `edit FILE [LINE]` (the editor pane's nvim). They move the focus only while
   you look at the layout tab, otherwise they show a notification (`DEVLAYOUT_FOCUS`).
-- A Claude Code skill (`skills/devlayout`), linked with `devlayout install-skill`.
+- The repository is also a Claude Code plugin (`claude plugin install devlayout --marketplace
+  merlin00/herdr-devlayout`): a skill that tells Claude when to use these commands, and a hook that focuses
+  Claude's pane before every question.
+- `doctor`: checks the required and optional parts and prints how to fix each.
 - Run from a pane shell, devlayout uses the same settings and state folders as the plugin action.

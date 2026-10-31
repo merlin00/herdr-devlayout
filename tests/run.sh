@@ -751,15 +751,93 @@ out=$(env -u HERDR_PLUGIN_STATE_DIR -u HERDR_PLUGIN_CONFIG_DIR -u XDG_CONFIG_HOM
 check "shell run -> reads the plugin's config.env" '[ $rc -eq 0 ] && runs_for w1:p2 | grep -q "exec my-review"'
 check "shell run -> keeps state in the plugin's state folder" '[ -n "$(ls "$T/home/.local/state/herdr/plugins/merlin00.devlayout/run/" 2>/dev/null)" ]'
 
-# T76 install-skill -> link into the Claude skills folder; never replaces a real folder
-setup proj
-out=$(CLAUDE_CONFIG_DIR="$T/claude" "$DL" install-skill 2>&1); rc=$?
-check "install-skill -> link to the bundled skill" '[ $rc -eq 0 ] && [ -L "$T/claude/skills/devlayout" ] && [ -f "$T/claude/skills/devlayout/SKILL.md" ]'
-out=$(CLAUDE_CONFIG_DIR="$T/claude" "$DL" install-skill 2>&1); rc=$?
-check "install-skill again -> fine" '[ $rc -eq 0 ] && [ -L "$T/claude/skills/devlayout" ]'
-rm -f "$T/claude/skills/devlayout"; mkdir -p "$T/claude/skills/devlayout"
-out=$(CLAUDE_CONFIG_DIR="$T/claude" "$DL" install-skill 2>&1); rc=$?
-check "install-skill over a real folder -> error, folder kept" '[ $rc -ne 0 ] && [ -d "$T/claude/skills/devlayout" ] && [ ! -L "$T/claude/skills/devlayout" ]'
+# ── hook question (Claude Code plugin hook before AskUserQuestion) ──
+# T78 in a layout tab -> the agent pane gets the focus, nothing printed
+setup proj; state_panes "claude,reviewr,nvim"; set_pane w1:p1 focused false; set_pane w1:p3 focused true
+out=$("$DL" hook question </dev/null 2>&1); rc=$?
+check "hook question -> agent pane focused, quiet" '[ $rc -eq 0 ] && [ -z "$out" ] && [ "$(focus_log)" = w1:p1 ]'
+
+# T79 outside herdr -> exit 0, no output, herdr untouched
+setup proj; state_panes "claude,reviewr,nvim"; cp "$MOCK_STATE" "$T/before.json"
+out=$(env -u HERDR_ENV "$DL" hook question </dev/null 2>&1); rc=$?
+check "hook question outside herdr -> quiet no-op" '[ $rc -eq 0 ] && [ -z "$out" ] && cmp -s "$MOCK_STATE" "$T/before.json"'
+
+# T80 a tab without the layout, or the user on another tab -> exit 0, focus unchanged, no error notice
+setup proj; state_panes ""
+out=$("$DL" hook question </dev/null 2>&1); rc=$?
+check "hook question, no layout -> quiet no-op" '[ $rc -eq 0 ] && [ -z "$out" ] && [ -z "$(focus_log)" ] && [ "$(nnotes)" = 0 ]'
+setup proj; state_panes "claude,reviewr,nvim," "" "t1,t1,t1,t2"; look_elsewhere
+out=$("$DL" hook question </dev/null 2>&1); rc=$?
+check "hook question, user on another tab -> focus unchanged, question notice" '[ $rc -eq 0 ] && [ -z "$(focus_log)" ] && [ "$(note 0 body)" = "Claude has a question" ]'
+
+# ── doctor ──
+# A complete setup: programs on PATH, key bindings, reviewr editor, file viewer, Claude plugin
+doctor_env() {
+  mkdir -p "$T/bin" "$T/home/.config/herdr/plugins/config/persiyanov.reviewr"
+  for _b in claude nvim herdr-reviewr; do printf '#!/bin/sh\nexit 0\n' >"$T/bin/$_b"; chmod +x "$T/bin/$_b"; done
+  # fake claude: `claude plugin list --json` prints $CLAUDE_PLUGINS
+  printf '#!/bin/sh\n[ "$1 $2 $3" = "plugin list --json" ] && printf "%%s\\n" "${CLAUDE_PLUGINS:-[]}"\nexit 0\n' >"$T/bin/claude"
+  ln -s "$DL" "$T/bin/devlayout"
+  printf '%s\n' '[[keys.command]]' 'command = "merlin00.devlayout.open"' '[[keys.command]]' 'command = "merlin00.devlayout.reset"' >"$T/home/.config/herdr/config.toml"
+  echo 'editor = "devlayout open-file {file} {line}"' >"$T/home/.config/herdr/plugins/config/persiyanov.reviewr/config.toml"
+  _tmp=$MOCK_STATE.tmp; jq '.plugins = [{"plugin_id": "herdr-file-viewer"}, {"plugin_id": "merlin00.devlayout"}]' "$MOCK_STATE" >"$_tmp" && mv "$_tmp" "$MOCK_STATE"
+  CLAUDE_PLUGINS=$(claude_plugins true); export CLAUDE_PLUGINS
+}
+# `claude plugin list --json` with the devlayout plugin at this version. $1=enabled (true|false)
+claude_plugins() { jq -cn --arg v "$("$DL" version | cut -d' ' -f2)" --argjson e "$1" '[{id: "devlayout@herdr-devlayout", version: $v, enabled: $e}]'; }
+doctor() { env -u XDG_CONFIG_HOME HOME="$T/home" PATH="$T/bin:/usr/bin:/bin" "$DL" doctor 2>&1; }
+
+# T81 everything in place -> exit 0, no missing or warn lines
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+out=$(doctor); rc=$?
+check "doctor, complete setup -> exit 0" '[ $rc -eq 0 ]'
+check "doctor, complete setup -> nothing missing" '! printf %s "$out" | grep -Eq "^ *(missing|warn|optional) "'
+check "doctor -> names the herdr version" 'printf %s "$out" | grep -q "herdr 0.9.5"'
+
+# T82 herdr too old -> exit 1 with the fix
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+out=$(MOCK_HERDR_VERSION=0.9.4 doctor); rc=$?
+check "doctor, herdr 0.9.4 -> exit 1, says herdr update" '[ $rc -eq 1 ] && printf %s "$out" | grep -q "^ *missing .*0.9.4" && printf %s "$out" | grep -q "herdr update"'
+
+# T83 optional parts missing -> exit 0, each with how to add it
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+_tmp=$MOCK_STATE.tmp; jq '.plugins = [{"plugin_id": "merlin00.devlayout"}]' "$MOCK_STATE" >"$_tmp" && mv "$_tmp" "$MOCK_STATE"
+out=$(CLAUDE_PLUGINS='[]' doctor); rc=$?
+check "doctor, no file viewer -> optional + install command" '[ $rc -eq 0 ] && printf %s "$out" | grep -q "^ *optional .*herdr-file-viewer" && printf %s "$out" | grep -q "herdr plugin install smarzban/herdr-file-viewer"'
+check "doctor, no Claude plugin -> optional + install command" 'printf %s "$out" | grep -q "claude plugin install devlayout --marketplace merlin00/herdr-devlayout"'
+
+# T84 Claude plugin of another version, or disabled -> warn
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+out=$(CLAUDE_PLUGINS='[{"id": "devlayout@herdr-devlayout", "version": "0.0.1", "enabled": true}]' doctor); rc=$?
+check "doctor, Claude plugin version differs -> warn, exit 0" '[ $rc -eq 0 ] && printf %s "$out" | grep -q "^ *warn .*0.0.1"'
+out=$(CLAUDE_PLUGINS=$(claude_plugins false) doctor)
+check "doctor, Claude plugin disabled -> warn with enable command" 'printf %s "$out" | grep -q "claude plugin enable"'
+
+# T85 missing pieces of the setup -> named with the fix
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+rm "$T/bin/devlayout" "$T/bin/nvim" "$T/home/.config/herdr/config.toml"
+out=$(doctor); rc=$?
+check "doctor, devlayout not on PATH -> ln -s hint" '[ $rc -eq 0 ] && printf %s "$out" | grep -q "ln -s"'
+check "doctor, nvim missing -> named" 'printf %s "$out" | grep -q "^ *warn .*nvim"'
+check "doctor, no key bindings -> named" 'printf %s "$out" | grep -q "^ *warn .*key binding"'
+
+# T86 no claude command -> the Claude plugin check is skipped, not an error
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+printf '%s\n' DEVLAYOUT_AGENT_CMD=codex >"$HERDR_PLUGIN_CONFIG_DIR/config.env"
+printf '#!/bin/sh\nexit 0\n' >"$T/bin/codex"; chmod +x "$T/bin/codex"; rm "$T/bin/claude"
+out=$(doctor); rc=$?
+check "doctor without claude -> Claude plugin check skipped" '[ $rc -eq 0 ] && printf %s "$out" | grep -q "skip.*claude"'
+
+# T87 outside herdr -> exit 1
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+out=$(env -u HERDR_ENV -u XDG_CONFIG_HOME HOME="$T/home" PATH="$T/bin:/usr/bin:/bin" "$DL" doctor 2>&1); rc=$?
+check "doctor outside herdr -> exit 1" '[ $rc -eq 1 ] && printf %s "$out" | grep -q "^ *missing .*inside herdr"'
+
+# ── Claude Code plugin files ──
+check "Claude plugin manifests are valid JSON" 'jq -e . "$ROOT/.claude-plugin/plugin.json" "$ROOT/.claude-plugin/marketplace.json" "$ROOT/hooks/hooks.json" >/dev/null'
+check "Claude plugin version = devlayout version = herdr-plugin.toml version" '_v=$("$DL" version | cut -d" " -f2); [ "$(jq -r .version "$ROOT/.claude-plugin/plugin.json")" = "$_v" ] && [ "$(jq -r ".plugins[0].version" "$ROOT/.claude-plugin/marketplace.json")" = "$_v" ] && grep -q "^version = \"$_v\"" "$ROOT/herdr-plugin.toml"'
+check "doctor minimum herdr = min_herdr_version" 'grep -q "^min_herdr_version = \"$(sed -n "s/^MIN_HERDR=\([0-9.]*\).*/\1/p" "$DL")\"" "$ROOT/herdr-plugin.toml"'
+check "plugin hook runs devlayout hook question" 'jq -r ".hooks.PreToolUse[0].hooks[0].command" "$ROOT/hooks/hooks.json" | grep -qF "bin/devlayout\" hook question"'
 
 echo
 echo "result: $pass passed, $fail failed"

@@ -26,6 +26,14 @@ herdr plugin install merlin00/herdr-devlayout
 herdr plugin list                        # merlin00.devlayout should be listed
 ```
 
+Then check what is in place and what is missing (after step 3 you can type just `devlayout doctor`):
+
+```sh
+sh "$(herdr plugin list --json | jq -r '.result.plugins[] | select(.plugin_id == "merlin00.devlayout") | .plugin_root')/bin/devlayout" doctor
+```
+
+Each line is `ok`, `missing` (required), `warn`, or `optional`, with the command that fixes it.
+
 To try a local checkout instead (for development):
 
 ```sh
@@ -125,15 +133,18 @@ Optional. Claude can bring you to the pane that fits the next step:
 - a long text for **you to edit** (commit message, prompt, config) → the editor pane's nvim, with the file open
 - a **question** with choices → back to the Claude pane
 
-Requires step 3, and for the popup the file viewer plugin:
+Requires step 3. Install the file viewer (for the popup) and the devlayout **Claude Code plugin**, which
+brings a skill (when to use which pane) and a hook (focus back to Claude before every question):
 
 ```sh
 herdr plugin install smarzban/herdr-file-viewer
-devlayout install-skill                  # links the skill to ~/.claude/skills/devlayout
+claude plugin install devlayout --marketplace merlin00/herdr-devlayout
+devlayout doctor                         # the last section should be all ok
 ```
 
-Start a new Claude session in the layout. Claude now uses these commands when they fit; you can also ask
-for them ("show me the plan in the viewer", "open the commit message in nvim"):
+Then restart Claude (`/exit`, then `claude --continue`): skills and hooks are loaded when a session starts.
+Claude now uses these commands when they fit; you can also ask for them ("show me the plan in the
+viewer", "open the commit message in nvim"):
 
 | Command | What it does |
 |---|---|
@@ -145,22 +156,8 @@ for them ("show me the plan in the viewer", "open the commit message in nvim"):
 The focus only moves while you look at the layout tab. If you are in another tab, you get a herdr
 notification instead. To never move the focus, set `DEVLAYOUT_FOCUS=off`.
 
-**Focus back to Claude on every question (hook).** Add this to `.claude/settings.json` in your project, or to
-`~/.claude/settings.json` for all projects:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "AskUserQuestion",
-        "hooks": [ { "type": "command", "command": "devlayout focus agent 'Claude has a question' >/dev/null 2>&1 || true" } ] }
-    ]
-  }
-}
-```
-
-Hooks are read when a Claude session starts, so restart Claude after adding it. Outside herdr,
-`devlayout focus` fails and the hook does nothing.
+The hook does nothing outside herdr or in a tab without the layout. To turn the plugin off for a while:
+`claude plugin disable devlayout@herdr-devlayout`.
 
 ## Settings
 
@@ -189,6 +186,8 @@ functions are not available there; use command names on your PATH or absolute pa
 
 ## Troubleshooting
 
+- **Something does not work and you are not sure why.** Run `devlayout doctor`; it names what is missing and
+  how to add it.
 - **A key binding does nothing and no notification appears.** Check the log:
   `herdr plugin log list --plugin merlin00.devlayout --limit 20`.
 - **"the current tab has N panes … Run reset"**: devlayout only builds in a one-pane tab and only repairs
@@ -204,10 +203,12 @@ functions are not available there; use command names on your PATH or absolute pa
 ## Uninstall
 
 ```sh
-herdr plugin uninstall merlin00.devlayout     # or: herdr plugin unlink merlin00.devlayout
+claude plugin uninstall devlayout@herdr-devlayout   # if you installed the Claude Code plugin (step 7)
+claude plugin marketplace remove herdr-devlayout
+herdr plugin uninstall merlin00.devlayout           # or: herdr plugin unlink merlin00.devlayout
 rm -rf "$(herdr plugin config-dir merlin00.devlayout)" ~/.local/state/herdr/plugins/merlin00.devlayout \
-       ~/.local/bin/devlayout ~/.claude/skills/devlayout
+       ~/.local/bin/devlayout
 ```
 
 Then remove the two `[[keys.command]]` blocks from `~/.config/herdr/config.toml`, run
-`herdr server reload-config`, set reviewr's `editor` back if you changed it, and remove the hooks from step 7.
+`herdr server reload-config`, and set reviewr's `editor` back if you changed it.
