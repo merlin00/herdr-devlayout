@@ -5,7 +5,10 @@
       {
         "matcher": "AskUserQuestion",
         "hooks": [
-          { "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/devlayout\" hook question" }
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/devlayout\" hook question >/dev/null 2>&1 || true"
+          }
         ]
       }
     ]

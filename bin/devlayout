@@ -111,14 +111,13 @@ shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 now() { date +%s; }
 
 # ── Preconditions ───────────────────────────────────────────
+# Run from a terminal outside herdr, the layout would be built in a detached server you can't see.
+# herdr panes, key bindings and plugin actions all have HERDR_ENV=1 or HERDR_ACTIVE_PANE_ID.
+in_herdr() { [ "${HERDR_ENV:-}" = 1 ] || [ -n "${HERDR_ACTIVE_PANE_ID:-}" ]; }
 require_herdr() {
   command -v "$HERDR" >/dev/null 2>&1 || die "herdr not found. Check your PATH"
   command -v jq >/dev/null 2>&1 || die "jq is required. Install it (brew install jq / apt install jq)"
-  # Run from a terminal outside herdr, the layout would be built in a detached server you can't see.
-  # herdr panes, key bindings and plugin actions all have HERDR_ENV=1 or HERDR_ACTIVE_PANE_ID.
-  if [ "${HERDR_ENV:-}" != 1 ] && [ -z "${HERDR_ACTIVE_PANE_ID:-}" ]; then
-    die "run this inside herdr: from a herdr pane, a herdr key binding or the plugin action"
-  fi
+  in_herdr || die "run this inside herdr: from a herdr pane, a herdr key binding or the plugin action"
 }
 
 # One run per project at a time (e.g. a repeated key press). A lock older than 2 minutes is treated as stale.
@@ -689,17 +688,14 @@ attention() {
   [ "${DEVLAYOUT_NOTIFY:-auto}" = off ] || "$HERDR" notification show "$1" --body "$2" >/dev/null 2>&1 || :
 }
 
-# 0 if focus may move in tab $1: allowed by DEVLAYOUT_FOCUS and the user looks at that tab.
-# Moving the focus to a pane of another tab would switch the user's screen to it (seen on 0.9.5).
-may_focus() {
-  [ "$DEVLAYOUT_FOCUS" != off ] || return 1
-  [ "$(focus_now | cut -d' ' -f1)" = "$1" ]
-}
+# 0 if focus may move in tab $1: allowed by DEVLAYOUT_FOCUS and the user looks at that tab ($2 = the
+# focused tab). Moving the focus to a pane of another tab would switch the user's screen to it (seen on 0.9.5).
+may_focus() { [ "$DEVLAYOUT_FOCUS" != off ] && [ "$2" = "$1" ]; }
 
-# Focus pane $2 of tab $1. The CLI focuses only by direction from a pane, so find a pane whose
-# neighbour in some direction is the target.
+# Focus pane $2 of tab $1 ($3 = the focused pane). The CLI focuses only by direction from a pane, so find
+# a pane whose neighbour in some direction is the target.
 focus_pane() {
-  [ "$(focus_now | cut -d' ' -f2)" != "$2" ] || return 0
+  [ "$3" != "$2" ] || return 0
   for _fp in $(panes "$1" | jq -r --arg p "$2" 'select(.pane_id != $p) | .pane_id'); do
     for _d in left right up down; do
       _n=$(h pane neighbor --direction "$_d" --pane "$_fp" | jq -r '.result.neighbor.neighbor_pane_id // empty')
@@ -711,8 +707,9 @@ focus_pane() {
 
 # $1=tab $2=pane $3=role $4=message shown instead when the focus may not move
 focus_role() {
-  if ! may_focus "$1"; then attention "devlayout: $3" "$4"; return 0; fi
-  focus_pane "$1" "$2" || die "could not move the focus to the $3 pane ($2): no neighbouring pane leads to it. Check the layout with status"
+  _now=$(focus_now)
+  if ! may_focus "$1" "${_now% *}"; then attention "devlayout: $3" "$4"; return 0; fi
+  focus_pane "$1" "$2" "${_now#* }" || die "could not move the focus to the $3 pane ($2): no neighbouring pane leads to it. Check the layout with status"
   say "focused the $3 pane ($2)"
 }
 
@@ -783,7 +780,7 @@ cmd_show() {
   case $_sf in "$_root"/*) ;; *) _root=$(root_of "$(dirname "$_sf")") ;; esac
   _rel=${_sf#"$_root"/}
   _target=$_rel${_sl:+:$_sl}
-  if ! may_focus "$_tab"; then attention "devlayout: show" "Claude wants to show you $_target"; return 0; fi
+  if ! may_focus "$_tab" "$(focus_now | cut -d' ' -f1)"; then attention "devlayout: show" "Claude wants to show you $_target"; return 0; fi
   _o=$("$HERDR" plugin pane open --plugin "$DEVLAYOUT_VIEWER" --entrypoint file-viewer --placement popup --focus \
         --env "HERDR_FILE_VIEWER_ROOT=$_root" --env "HERDR_FILE_VIEWER_OPEN=$_target" 2>&1) || {
     case $_o in
@@ -821,18 +818,20 @@ cmd_edit() {
   focus_role "$_tab" "$_ep" editor "Claude opened $(basename "$_file") in the editor pane"
 }
 
-# Claude Code plugin hook (hooks/hooks.json), before Claude asks a question. Never fails and prints
-# nothing: outside herdr or in a tab without the layout it does nothing.
+# Claude Code plugin hook (hooks/hooks.json), before Claude asks a question: focus the pane of the Claude
+# that asks (its HERDR_PANE_ID), which is usually the agent pane. Never fails and prints nothing: outside
+# herdr or in a tab without the layout it does nothing. (hooks.json also drops output and errors, since
+# a broken config.env would stop the script before this runs.)
 cmd_hook() {
   [ "${1:-}" = question ] || return 0
   [ "${HERDR_ENV:-}" = 1 ] || return 0
   command -v "$HERDR" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
   (
     die() { exit 1; }    # no error notification from a hook
+    _me=$(current_pane)
     _tab=$(current_tab)
-    _a=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_AGENT")
-    [ -n "$_a" ] || exit 0
-    focus_role "$_tab" "$_a" agent "Claude has a question"
+    [ -n "$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_AGENT")" ] || exit 0
+    focus_role "$_tab" "$_me" agent "Claude has a question"
   ) >/dev/null 2>&1 || :
   return 0
 }
@@ -845,13 +844,24 @@ dline() {
   if [ -n "${3:-}" ]; then printf '           -> %s\n' "$3"; fi
   if [ "$1" = missing ]; then DOC_FAIL=1; fi
 }
-ver_ge() {   # $1 >= $2 (x.y.z)
-  awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, ".")
-    for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
-    exit 0 }'
+# $1 >= $2 for x.y.z[-pre]. A prerelease is older than its release (0.9.5-rc1 < 0.9.5).
+ver_ge() {
+  awk -v a="$1" -v b="$2" '
+    function pre(v) { return index(v, "-") ? substr(v, index(v, "-") + 1) : "" }
+    function base(v) { return index(v, "-") ? substr(v, 1, index(v, "-") - 1) : v }
+    BEGIN { split(base(a), x, "."); split(base(b), y, ".")
+      for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+      if (pre(a) != "" && pre(b) == "") exit 1
+      exit 0 }'
 }
+# FILE has an uncommented line containing TEXT (literal)
+has_line() { awk -v s="$2" '/^[[:space:]]*#/ { next } index($0, s) { f = 1 } END { exit !f }' "$1" 2>/dev/null; }
 cmd_doctor() {
-  _cfg=${XDG_CONFIG_HOME:-$HOME/.config}/herdr
+  # herdr's config folder: the parent of the plugin config folder herdr gave us, else herdr's default
+  case $CONFIG_DIR in
+    */plugins/config/"$PLUGIN_ID") _cfg=${CONFIG_DIR%/plugins/config/"$PLUGIN_ID"} ;;
+    *) _cfg=${XDG_CONFIG_HOME:-$HOME/.config}/herdr ;;
+  esac
   printf 'devlayout %s doctor\n\nrequired\n' "$VERSION"
   _hok=
   if command -v "$HERDR" >/dev/null 2>&1; then
@@ -862,12 +872,12 @@ cmd_doctor() {
   else dline missing "herdr is not on PATH" "install herdr: https://herdr.dev"; fi
   if command -v jq >/dev/null 2>&1; then dline ok jq
   else dline missing "jq is not installed" "brew install jq / apt install jq"; fi
-  if [ "${HERDR_ENV:-}" = 1 ] || [ -n "${HERDR_ACTIVE_PANE_ID:-}" ]; then dline ok "running inside herdr"
+  if in_herdr; then dline ok "running inside herdr"
   else dline missing "not running inside herdr" "run devlayout doctor from a herdr pane"; fi
 
   printf '\nlayout programs\n'
   for _pc in "agent:$(first_word "$DEVLAYOUT_AGENT_CMD"):DEVLAYOUT_AGENT_CMD" \
-             "editor:$(editor_procname):DEVLAYOUT_EDITOR" \
+             "editor:$(editor_procname):DEVLAYOUT_EDITOR${DEVLAYOUT_EDITOR_CMD:+_CMD}" \
              "review:$(first_word "$DEVLAYOUT_REVIEW_CMD"):DEVLAYOUT_REVIEW_CMD"; do
     _r=${_pc%%:*}; _p=${_pc#*:}; _p=${_p%%:*}; _v=${_pc##*:}
     if command -v "$_p" >/dev/null 2>&1; then dline ok "$_r: $_p"
@@ -875,18 +885,22 @@ cmd_doctor() {
   done
 
   printf '\nkey bindings\n'
-  if grep -q 'merlin00\.devlayout\.open' "$_cfg/config.toml" 2>/dev/null; then dline ok "open and reset keys in $_cfg/config.toml"
-  else dline warn "no key binding for merlin00.devlayout.open in $_cfg/config.toml" "add the [[keys.command]] blocks from the guide (step 2), then: herdr server reload-config"; fi
+  _nokeys=
+  for _k in open reset; do has_line "$_cfg/config.toml" "\"$PLUGIN_ID.$_k\"" || _nokeys="$_nokeys $PLUGIN_ID.$_k"; done
+  if [ -z "$_nokeys" ]; then dline ok "open and reset keys in $_cfg/config.toml"
+  else dline warn "no key binding for$_nokeys in $_cfg/config.toml" "add the [[keys.command]] blocks from the guide (step 2), then: herdr server reload-config"; fi
 
   printf '\nreviewr opens files in the editor pane (optional)\n'
   if command -v devlayout >/dev/null 2>&1; then dline ok "devlayout on PATH"
   else dline optional "devlayout is not on PATH (reviewr runs it without a shell)" \
     "ln -s \"\$(herdr plugin list --json | jq -r '.result.plugins[] | select(.plugin_id == \"$PLUGIN_ID\") | .plugin_root')/bin/devlayout\" ~/.local/bin/devlayout"; fi
-  if grep -q 'devlayout open-file' "$_cfg/plugins/config/persiyanov.reviewr/config.toml" 2>/dev/null; then dline ok "reviewr editor = devlayout open-file"
+  if has_line "$_cfg/plugins/config/persiyanov.reviewr/config.toml" 'devlayout open-file'; then dline ok "reviewr editor = devlayout open-file"
   else dline optional "reviewr's editor is not devlayout open-file" "add to $_cfg/plugins/config/persiyanov.reviewr/config.toml: editor = \"devlayout open-file {file} {line}\""; fi
 
   printf '\nClaude guides you to the right pane (optional)\n'
-  if [ -n "$_hok" ] && command -v jq >/dev/null 2>&1; then
+  if ! command -v jq >/dev/null 2>&1; then dline skip "file viewer and Claude Code plugin not checked (needs jq)"
+  elif [ -z "$_hok" ]; then dline skip "file viewer not checked (needs a running herdr $MIN_HERDR or later)"
+  else
     if "$HERDR" plugin list --json 2>/dev/null | jq -e --arg id "$DEVLAYOUT_VIEWER" '.result.plugins[]? | select(.plugin_id == $id)' >/dev/null 2>&1; then
       dline ok "file viewer: $DEVLAYOUT_VIEWER"
     else dline optional "file viewer $DEVLAYOUT_VIEWER is not installed (for devlayout show)" "herdr plugin install smarzban/herdr-file-viewer"; fi
@@ -894,7 +908,7 @@ cmd_doctor() {
   if ! command -v claude >/dev/null 2>&1; then dline skip "claude is not on PATH; Claude Code plugin not checked"
   elif ! command -v jq >/dev/null 2>&1; then :
   else
-    _cp=$(claude plugin list --json 2>/dev/null | jq -c '[.[]? | select(.id | startswith("devlayout@"))] | first // empty' 2>/dev/null) || _cp=
+    _cp=$(claude plugin list --json 2>/dev/null | jq -c '[.[]? | objects | select((.id // "" | tostring) | startswith("devlayout@"))] | first // empty' 2>/dev/null) || _cp=
     if [ -z "$_cp" ]; then
       dline optional "Claude Code plugin devlayout is not installed (skill + question hook)" "claude plugin install devlayout --marketplace merlin00/herdr-devlayout"
     else

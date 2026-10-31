@@ -833,6 +833,59 @@ setup proj; state_panes "claude,reviewr,nvim"; doctor_env
 out=$(env -u HERDR_ENV -u XDG_CONFIG_HOME HOME="$T/home" PATH="$T/bin:/usr/bin:/bin" "$DL" doctor 2>&1); rc=$?
 check "doctor outside herdr -> exit 1" '[ $rc -eq 1 ] && printf %s "$out" | grep -q "^ *missing .*inside herdr"'
 
+# T88 the hook focuses the pane of the Claude that asks, not the labelled agent pane
+setup proj; state_panes "claude,reviewr,nvim"; set_pane w1:p1 focused false; set_pane w1:p2 focused true
+out=$(HERDR_PANE_ID=w1:p3 "$DL" hook question </dev/null 2>&1); rc=$?
+check "hook question from a Claude in the editor pane -> that pane focused" '[ $rc -eq 0 ] && [ "$(focus_log)" = w1:p3 ]'
+
+# T89 the plugin hook command never fails or prints, even with a broken config.env
+setup proj; state_panes "claude,reviewr,nvim"
+printf '%s\n' 'echo broken >&2' 'false' >"$HERDR_PLUGIN_CONFIG_DIR/config.env"
+hookcmd=$(jq -r ".hooks.PreToolUse[0].hooks[0].command" "$ROOT/hooks/hooks.json")
+out=$(CLAUDE_PLUGIN_ROOT="$ROOT" sh -c "$hookcmd" </dev/null 2>&1); rc=$?
+check "plugin hook command with a broken config.env -> exit 0, quiet" '[ $rc -eq 0 ] && [ -z "$out" ]'
+
+# T90 doctor: an odd entry in claude plugin list does not hide the installed plugin
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+out=$(CLAUDE_PLUGINS="$(printf '%s' "$CLAUDE_PLUGINS" | jq -c '[{id: null}, {version: "1"}] + .')" doctor)
+check "doctor, entry without id in claude plugin list -> plugin still ok" 'printf %s "$out" | grep -q "^ *ok .*Claude Code plugin devlayout@"'
+
+# T91 doctor: key bindings must be real (not commented out) and include reset
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+printf '%s\n' '# command = "merlin00.devlayout.open"' '# command = "merlin00.devlayout.reset"' >"$T/home/.config/herdr/config.toml"
+out=$(doctor)
+check "doctor, commented-out key bindings -> warn" 'printf %s "$out" | grep -q "^ *warn .*key binding"'
+printf '%s\n' 'command = "merlin00.devlayout.open"' >"$T/home/.config/herdr/config.toml"
+out=$(doctor)
+check "doctor, only the open key -> warn names reset" 'printf %s "$out" | grep -q "^ *warn .*merlin00.devlayout.reset"'
+
+# T92 doctor: a prerelease of the minimum version is not enough; a newer minor is
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+out=$(MOCK_HERDR_VERSION=0.9.5-rc1 doctor); rc=$?
+check "doctor, herdr 0.9.5-rc1 -> missing" '[ $rc -eq 1 ] && printf %s "$out" | grep -q "^ *missing .*0.9.5-rc1"'
+out=$(MOCK_HERDR_VERSION=0.10.0 doctor); rc=$?
+check "doctor, herdr 0.10.0 -> ok" '[ $rc -eq 0 ] && printf %s "$out" | grep -q "^ *ok .*herdr 0.10.0"'
+
+# T93 doctor: with DEVLAYOUT_EDITOR_CMD the fix names that setting
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+echo "DEVLAYOUT_EDITOR_CMD='hx .'" >"$HERDR_PLUGIN_CONFIG_DIR/config.env"
+out=$(doctor)
+check "doctor, missing editor from EDITOR_CMD -> names DEVLAYOUT_EDITOR_CMD" 'printf %s "$out" | grep -q "set DEVLAYOUT_EDITOR_CMD"'
+
+# T94 doctor: checks that cannot run say so (skip) instead of vanishing
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+out=$(MOCK_SERVER_DOWN=1 doctor); rc=$?
+check "doctor, server down -> exit 1, file viewer check skipped" '[ $rc -eq 1 ] && printf %s "$out" | grep -q "^ *skip .*file viewer"'
+
+# T95 doctor: herdr config folder comes from the plugin config folder when herdr sets it
+setup proj; state_panes "claude,reviewr,nvim"; doctor_env
+mv "$T/home/.config/herdr" "$T/herdrcfg"
+out=$(HERDR_PLUGIN_CONFIG_DIR="$T/herdrcfg/plugins/config/merlin00.devlayout" doctor)
+check "doctor, plugin config dir elsewhere -> key bindings and reviewr found there" '! printf %s "$out" | grep -Eq "^ *(warn|optional) .*(key binding|reviewr)"'
+
+# T96 bin/devlayout sticks to its allowed tools (no grep)
+check "bin/devlayout does not call grep" '! awk "/^[[:space:]]*#/ { next } /(^|[^a-z_-])grep /" "$DL" | grep -q .'
+
 # ── Claude Code plugin files ──
 check "Claude plugin manifests are valid JSON" 'jq -e . "$ROOT/.claude-plugin/plugin.json" "$ROOT/.claude-plugin/marketplace.json" "$ROOT/hooks/hooks.json" >/dev/null'
 check "Claude plugin version = devlayout version = herdr-plugin.toml version" '_v=$("$DL" version | cut -d" " -f2); [ "$(jq -r .version "$ROOT/.claude-plugin/plugin.json")" = "$_v" ] && [ "$(jq -r ".plugins[0].version" "$ROOT/.claude-plugin/marketplace.json")" = "$_v" ] && grep -q "^version = \"$_v\"" "$ROOT/herdr-plugin.toml"'

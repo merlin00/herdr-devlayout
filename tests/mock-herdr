@@ -95,10 +95,14 @@ def main(argv):
         nxt[w] = max(nxt.get(w, 0), num(p["pane_id"]) + 1)
     if argv[:2] == ["status", "server"]:
         # MOCK_HERDR_VERSION sets the server version (real 0.9.5 prints "version: 0.9.5" as the 2nd line)
+        if os.environ.get("MOCK_SERVER_DOWN") == "1":   # like real herdr with no server: error, exit 1
+            fail("no herdr server is running")
         print("status: running")
         print("version: " + os.environ.get("MOCK_HERDR_VERSION", "0.9.5"))
         return
     if argv[:3] == ["plugin", "list", "--json"]:
+        if os.environ.get("MOCK_SERVER_DOWN") == "1":
+            fail("no herdr server is running")
         out({"type": "plugin_list", "plugins": s.get("plugins", [])})
         return
     if not argv:
