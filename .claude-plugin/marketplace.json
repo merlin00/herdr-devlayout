@@ -8,7 +8,7 @@
     {
       "name": "devlayout",
       "source": "./",
-      "description": "Lets Claude guide you to the right pane of a herdr devlayout tab (skill + question hook). Needs the herdr plugin merlin00/herdr-devlayout.",
+      "description": "Lets Claude guide you to the right pane of a herdr devlayout tab: read in a file viewer popup, edit in nvim, review changes in reviewr (skill + question hook). Needs the herdr plugin merlin00/herdr-devlayout.",
       "version": "0.1.0"
     }
   ]

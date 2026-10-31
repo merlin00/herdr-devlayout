@@ -1,10 +1,17 @@
 {
   "name": "devlayout",
   "version": "0.1.0",
-  "description": "Lets Claude guide you to the right pane of a herdr devlayout tab: a file viewer popup to read, the editor pane's nvim to edit, and back to Claude for questions.",
-  "author": { "name": "merlin00" },
+  "description": "Lets Claude guide you to the right pane of a herdr devlayout tab: a file viewer popup to read, the editor pane's nvim to edit, reviewr to review its changes, and back to Claude for questions.",
+  "author": {
+    "name": "merlin00"
+  },
   "homepage": "https://github.com/merlin00/herdr-devlayout",
   "repository": "https://github.com/merlin00/herdr-devlayout",
   "license": "MIT",
-  "keywords": ["herdr", "nvim", "layout", "focus"]
+  "keywords": [
+    "herdr",
+    "nvim",
+    "layout",
+    "focus"
+  ]
 }

@@ -9,7 +9,8 @@ The user works in a herdr tab with three panes: you (the agent) top left, nvim (
 and a review pane on the right. `devlayout` moves the user's focus to the pane that fits the next step.
 
 Run `devlayout`. If it is not on PATH, run `sh <this skill's folder>/../../bin/devlayout` instead.
-Most commands print one line (`state` prints JSON, `doctor` a report). On error a command exits non-zero with the cause and the next step. If a command
+`show`, `edit` and `focus` print one line; `state` prints JSON, `doctor` a report, and `open` several lines
+(pass on any `skipped:` line). On error a command exits non-zero with the cause and the next step. If a command
 fails because something is missing (a plugin, a program, the layout), run `devlayout doctor` and pass on
 its `missing`, `warn` and `optional` lines with their fix commands.
 
@@ -66,25 +67,32 @@ file, a draft.
 
 ## 4. Ask for a review of your changes: `focus review`
 
-The review pane runs reviewr: it shows the uncommitted diff, the user comments on lines, and `s` puts every
-comment into your input. Use it when you changed files and the user wants to check them before going on,
-for example after a plan step or before a commit.
+The review pane runs reviewr. By default it shows the uncommitted changes (git-ignored files never show);
+the user comments on lines with `c`, and `s` puts every comment into your input box, where the user sends
+them with Enter. Use it when you changed files and the user wants to check them before going on, for
+example after a plan step or before a commit.
 
-1. Only when there is something to review: `git status --short` lists changed files that are not git-ignored
-   (reviewr does not show ignored files).
-2. Run:
+1. Run `devlayout state` and look at `roles.review.state`:
+   - `running`: go on.
+   - `stopped`: run `devlayout open` (it restarts the review program), then go on.
+   - `busy <program>`: the user runs something else there. Ask them to quit it; do not move the focus.
+   - `missing`: the layout lacks a review pane. Handle it as in section 6 (ask before `devlayout reset`).
+2. Check that there is something to review: `git status --short` lists the changed files that are not
+   git-ignored. If it prints nothing, or the project is not a git repository, skip the review step and
+   say why.
+3. Run, with the real number of changed files:
 
    ```bash
-   devlayout focus review "Claude changed 3 files; review them in reviewr"
+   devlayout focus review "Claude changed <N> files; review them in reviewr"
    ```
 
-3. End your turn with one line: which files changed and what to look at first. Tell the user to comment
-   with `c` and send the comments with `s`. Do not wait or poll; the comments arrive as the next message.
-4. Treat each comment as a request: fix it, or answer why not.
+4. End your turn with one line: which files changed and what to look at first. Tell the user to comment
+   with `c`, press `s`, then press Enter in your pane to send. Do not wait or poll; the comments arrive as
+   the next message.
+5. Treat each comment as a request: fix it, or answer why not.
 
 Do not move the focus to the review pane after every edit. Do it once per step, when the user asked for a
-review or a plan step is done, and not when `state` shows `review` as `stopped`, `missing` or `busy`
-(say that the review pane is not running instead; `devlayout open` restarts it).
+review or a plan step is done.
 
 ## 5. Choices and questions
 
