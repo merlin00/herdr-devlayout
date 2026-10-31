@@ -29,7 +29,9 @@ setup() {   # $1 = project directory name
   export HERDR_ENV=1
   export HERDR_PANE_ID=w1:p1
   export HERDR_PLUGIN_ROOT="$ROOT"
-  unset HERDR_ACTIVE_PANE_ID HERDR_ACTIVE_PANE_CWD DEVLAYOUT_DEBUG 2>/dev/null || :
+  # herdr's own context of the pane running the tests must not leak in (keys depend on session and tab)
+  unset HERDR_ACTIVE_PANE_ID HERDR_ACTIVE_PANE_CWD HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SESSION \
+    HERDR_SOCKET_PATH DEVLAYOUT_DEBUG 2>/dev/null || :
   mkdir -p "$HERDR_PLUGIN_CONFIG_DIR"
 }
 # $1 = labels (comma separated, empty = null) $2 = agent values (comma) $3 = tabs (comma, e.g. t1,t1,t2; default all t1)
@@ -73,8 +75,13 @@ set_pane() {
 }
 runs_for() { jq -r --arg p "$1" '[.runs[] | select(.pane == $p) | .text] | join("\n")' "$MOCK_STATE"; }
 nruns() { q '.runs | length'; }
-# Project state key (pid / lock / socket file name) = the editor-socket file name without .sock
-key_of() { _k=$("$DL" editor-socket "$1"); _k=${_k##*/}; printf '%s\n' "${_k%.sock}"; }
+# Project state key (pid / lock / socket file name) = the editor-socket file name without .sock.
+# $1=project dir [$2=tab id; default: the tab of HERDR_PANE_ID]
+key_of() {
+  if [ -n "${2:-}" ]; then _k=$(HERDR_PANE_ID='' HERDR_TAB_ID=$2 "$DL" editor-socket "$1")
+  else _k=$("$DL" editor-socket "$1"); fi
+  _k=${_k##*/}; printf '%s\n' "${_k%.sock}"
+}
 # Pid file path from the command typed into a pane (sh -c '<echo $$ > path; ...>')
 pidpath_from_run() {
   python3 -c 'import shlex,sys; inner=shlex.split(sys.argv[1])[2]; print(shlex.split(inner.split(";")[0])[-1])' "$(runs_for "$1" | tail -n1)"
@@ -397,7 +404,7 @@ setup p1; P2=$T/p2; mkdir -p "$P2"; unset HERDR_PANE_ID
 # shellcheck disable=SC2046
 state_multi $(three w1 "$PROJ") $(three w2 "$P2")
 echo "DEVLAYOUT_STARTUP=1" >"$HERDR_PLUGIN_CONFIG_DIR/config.env"
-mkdir -p "$HERDR_PLUGIN_STATE_DIR/run/$(key_of "$PROJ").lock"
+mkdir -p "$HERDR_PLUGIN_STATE_DIR/run/$(key_of "$PROJ" w1:t1).lock"
 out=$("$DL" startup 2>&1); rc=$?
 check "startup locked tab -> that tab skipped, the other repaired" '[ $rc -eq 0 ] && [ -z "$(runs_for w1:p3)" ] && [ -n "$(runs_for w2:p3)" ] && printf %s "$out" | grep -q "in progress"'
 
@@ -429,7 +436,7 @@ echo "DEVLAYOUT_WORKTREE=1" >"$HERDR_PLUGIN_CONFIG_DIR/config.env"
 out=$(HERDR_PLUGIN_EVENT_JSON=$(evt worktree_created w1 w1:t1 "$PROJ") "$DL" worktree-event 2>&1); rc=$?
 check "worktree created -> layout built" '[ $rc -eq 0 ] && [ "$(q ".panes | length")" = 3 ] && [ "$(q "[.panes[] | .label] | join(\",\")")" = "claude,reviewr,nvim" ]'
 check "worktree created -> new agent, editor and review typed" 'runs_for w1:p1 | grep -q "exec claude" && ! runs_for w1:p1 | grep -q continue && [ -n "$(runs_for w1:p2)" ] && [ -n "$(runs_for w1:p3)" ]'
-check "worktree created -> socket keyed by the worktree path" 'runs_for w1:p3 | grep -qF "$(key_of "$PROJ").sock"'
+check "worktree created -> socket keyed by the worktree path and tab" 'runs_for w1:p3 | grep -qF "$(key_of "$PROJ" w1:t1).sock"'
 
 # T38 worktree.opened for an already open workspace -> leave it alone
 setup wt; state_panes ""; unset HERDR_PANE_ID
@@ -452,7 +459,7 @@ check "worktree event with 2 panes -> no change, auto_open hint" '[ $rc -eq 0 ] 
 # T41 lock held (created and opened run at the same time) -> exit quietly, no change
 setup wt; state_panes ""; unset HERDR_PANE_ID
 echo "DEVLAYOUT_WORKTREE=1" >"$HERDR_PLUGIN_CONFIG_DIR/config.env"
-mkdir -p "$HERDR_PLUGIN_STATE_DIR/run/$(key_of "$PROJ").lock"
+mkdir -p "$HERDR_PLUGIN_STATE_DIR/run/$(key_of "$PROJ" w1:t1).lock"
 out=$(HERDR_PLUGIN_EVENT_JSON=$(evt worktree_created w1 w1:t1 "$PROJ") "$DL" worktree-event 2>&1); rc=$?
 check "worktree event while locked -> quiet exit 0, no change" '[ $rc -eq 0 ] && [ -z "$out" ] && [ "$(nruns)" = 0 ]'
 
