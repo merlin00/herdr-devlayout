@@ -14,7 +14,9 @@ First release. Requires herdr 0.9.5 or later (macOS, Linux).
 - Works on the current tab only; other tabs are never counted or closed.
 - Agent resume with `claude --continue`, falling back to a new session when there is nothing to resume.
   Leaves the agent pane alone while herdr resumes the agent itself after a server restart.
-- Projects are keyed by path, so two projects with the same folder name never share state or an editor socket.
+- Every tab has its own state and editor socket (keyed by project path, herdr session and tab), so the same
+  folder in two tabs or two herdr sessions works, and same-named folders never collide. An nvim that already
+  answers on the tab's socket counts as running.
 - `open-file` opens a file in the layout's nvim, for reviewr's `editor` setting. If that nvim was quit, it is
   started again in the editor pane with the file instead of taking over the reviewr pane.
 - A program that quits right after it was started is restarted by the next open (before, it counted as

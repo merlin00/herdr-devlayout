@@ -886,6 +886,39 @@ check "doctor, plugin config dir elsewhere -> key bindings and reviewr found the
 # T96 bin/devlayout sticks to its allowed tools (no grep)
 check "bin/devlayout does not call grep" '! awk "/^[[:space:]]*#/ { next } /(^|[^a-z_-])grep /" "$DL" | grep -q .'
 
+# ── keys per tab and session ──
+# T97 the editor socket belongs to the tab (and session), not only to the folder
+setup proj; state_panes "," "" "t1,t2"
+s1=$(HERDR_PANE_ID=w1:p1 "$DL" editor-socket "$PROJ"); s2=$(HERDR_PANE_ID=w1:p2 "$DL" editor-socket "$PROJ")
+check "editor-socket: same folder, other tab -> other socket" '[ -n "$s1" ] && [ "$s1" != "$s2" ]'
+sa=$(HERDR_SESSION=a "$DL" editor-socket "$PROJ"); sb=$(HERDR_SESSION=b "$DL" editor-socket "$PROJ")
+check "editor-socket: same tab, other herdr session -> other socket" '[ "$sa" != "$sb" ]'
+o1=$(env -u HERDR_ENV HERDR_PANE_ID=w1:p1 "$DL" editor-socket "$PROJ"); o2=$(env -u HERDR_ENV HERDR_PANE_ID=w1:p2 "$DL" editor-socket "$PROJ")
+check "editor-socket outside herdr -> by path only" '[ "$o1" = "$o2" ] && [ "$o1" != "$s1" ]'
+check "editor-socket keeps the folder name" 'case ${s1##*/} in proj-????????.sock) true ;; *) false ;; esac'
+
+# T98 the same folder in two tabs: the second tab gets its own editor, not blocked by the first one's nvim
+setup proj; state_panes "," "" "t1,t2"; fake_nvim
+rm -f "$(HERDR_PANE_ID=w1:p1 "$DL" editor-socket "$PROJ")"
+out=$(PATH="$T/bin:$PATH" HERDR_PANE_ID=w1:p1 "$DL" open 2>&1)
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$(HERDR_PANE_ID=w1:p1 "$DL" editor-socket "$PROJ")"
+out=$(PATH="$T/bin:$PATH" HERDR_PANE_ID=w1:p2 "$DL" open 2>&1); rc=$?
+e2=$(q '.panes[] | select(.tab_id == "w1:t2" and .label == "nvim") | .pane_id')
+check "same folder, second tab -> its own editor started" '[ $rc -eq 0 ] && [ -n "$e2" ] && runs_for "$e2" | grep -q "nvim --listen"'
+check "same folder, second tab -> socket of that tab" 'runs_for "$e2" | grep -qF "$(HERDR_PANE_ID=w1:p2 "$DL" editor-socket "$PROJ")"'
+
+# T99 an nvim answering on the tab's socket counts as running, even without a pid file
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+out=$(PATH="$T/bin:$PATH" "$DL" open 2>&1)
+check "listening nvim, no pid file -> editor not started again" '[ -z "$(runs_for w1:p3)" ]'
+out=$(PATH="$T/bin:$PATH" "$DL" state 2>&1)
+check "listening nvim, no pid file -> state says running" '[ "$(printf %s "$out" | jq -r .roles.editor.state)" = running ]'
+
+# T100 building a tab whose socket already answers -> no second nvim typed, and it says why
+setup proj; state_panes ""; fake_nvim
+out=$(PATH="$T/bin:$PATH" "$DL" open 2>&1)
+check "build, tab socket already answers -> editor not typed, reason given" '[ -z "$(runs_for w1:p3)" ] && printf %s "$out" | grep -q "already listens"'
+
 # ── Claude Code plugin files ──
 check "Claude plugin manifests are valid JSON" 'jq -e . "$ROOT/.claude-plugin/plugin.json" "$ROOT/.claude-plugin/marketplace.json" "$ROOT/hooks/hooks.json" >/dev/null'
 check "Claude plugin version = devlayout version = herdr-plugin.toml version" '_v=$("$DL" version | cut -d" " -f2); [ "$(jq -r .version "$ROOT/.claude-plugin/plugin.json")" = "$_v" ] && [ "$(jq -r ".plugins[0].version" "$ROOT/.claude-plugin/marketplace.json")" = "$_v" ] && grep -q "^version = \"$_v\"" "$ROOT/herdr-plugin.toml"'

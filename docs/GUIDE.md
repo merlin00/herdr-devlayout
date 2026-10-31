@@ -122,8 +122,8 @@ keeps the focus. If you quit the editor pane's nvim, `e` starts it again in the 
 Only when the editor pane is busy with another program (or the file belongs to another project) does the
 file open in nvim inside the reviewr pane; quit that nvim to get reviewr back.
 
-If you start nvim yourself and want it to receive these files, start it with
-`nvim --listen "$(devlayout editor-socket)"`.
+If you start nvim yourself and want it to receive these files, start it in the editor pane with
+`nvim --listen "$(devlayout editor-socket)"` (each tab has its own socket).
 
 ## 7. Let Claude guide you to the right pane
 

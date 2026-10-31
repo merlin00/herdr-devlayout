@@ -109,9 +109,10 @@ add `auto_open = false` to `~/.config/herdr/plugins/config/persiyanov.reviewr/co
 
 ### Open files from reviewr in the editor pane
 
-The editor pane runs `nvim --listen ~/.cache/nvim/<folder name>-<path hash>.sock`, one socket per project path
-(so two projects with the same folder name never share an editor). Print the path with `devlayout editor-socket [DIR]`;
-if you start nvim yourself and want it to receive files, use `nvim --listen "$(devlayout editor-socket)"`.
+The editor pane runs `nvim --listen ~/.cache/nvim/<folder name>-<hash>.sock`, one socket per tab: the hash covers
+the project path, the herdr session and the tab, so the same folder open in two tabs or two herdr sessions gets two
+editors that never collide. Print this tab's path with `devlayout editor-socket [DIR]`; if you start nvim yourself in
+the editor pane and want it to receive files, use `nvim --listen "$(devlayout editor-socket)"`.
 Point reviewr's editor at it (`~/.config/herdr/plugins/config/persiyanov.reviewr/config.toml`):
 
 ```toml
@@ -167,7 +168,6 @@ use real commands or absolute paths.
   by hand in those panes are not detected as "running", but devlayout checks the pane's foreground
   process (`herdr pane process-info`) before typing and skips the pane if anything other than the shell
   is in front ("skipped: editor(nvim)"). Quit that program and run open again to start the role.
-- Running the layout for the **same project** in two tabs at once shares one set of state and one editor socket.
 - Moving or renaming the project folder changes its key: an nvim started before the move keeps the old socket
   and no longer receives files. Quit it and run open.
 - If you restart the herdr server before sending the new Claude session a single message, herdr's own resume

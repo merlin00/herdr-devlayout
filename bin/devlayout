@@ -179,12 +179,28 @@ current_tab() {
 # Directory -> project root (git top level, otherwise the directory itself)
 root_of() { git -C "$1" rev-parse --show-toplevel 2>/dev/null || (cd "$1" && pwd -P); }
 
-# Project root -> state key "<first 40 chars of folder name>-<CRC32 of the path, 8 hex>".
-# Used for pid, cooldown, lock and nvim socket file names, so same-named folders at different paths
-# never collide. The name is cut to 40 chars for the socket path limit (104 bytes on macOS).
+# Project root [+ tab] -> state key "<first 40 chars of folder name>-<CRC32, 8 hex>". The CRC covers the
+# path, and with a tab also the herdr session and the tab id (tab ids restart at w1:t1 in every session).
+# Used for pid, cooldown, lock and nvim socket file names, so every tab has its own editor and state, even
+# for the same folder. The name is cut to 40 chars for the socket path limit (104 bytes on macOS).
+# $1=root $2=tab id (empty outside herdr: the path alone)
 proj_key() {
+  _pk=$1
+  if [ -n "${2:-}" ]; then _pk="$1|${HERDR_SESSION:-default}|$2"; fi
   printf '%s-%s\n' "$(basename "$1" | awk '{ print substr($0, 1, 40) }')" \
-    "$(printf '%s' "$1" | cksum | awk '{ printf "%08x", $1 }')"
+    "$(printf '%s' "$_pk" | cksum | awk '{ printf "%08x", $1 }')"
+}
+
+# Tab for a key when no tab is given: the current pane's tab (follows a pane moved to another tab),
+# else HERDR_TAB_ID, else nothing (outside herdr). Never fails.
+key_tab() {
+  in_herdr || return 0
+  _kt=
+  _kp=${HERDR_ACTIVE_PANE_ID:-${HERDR_PANE_ID:-}}
+  if [ -n "$_kp" ] && command -v "$HERDR" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    _kt=$("$HERDR" pane get "$_kp" 2>/dev/null | jq -r --arg p "$_kp" '[.. | objects | select(.pane_id? == $p) | .tab_id? // empty] | first // empty' 2>/dev/null) || _kt=
+  fi
+  printf '%s\n' "${_kt:-${HERDR_TAB_ID:-}}"
 }
 
 # Project root of a tab, from the working directory of the agent pane (or the first pane). $1=tab
@@ -250,7 +266,13 @@ agent_alive() {   # $1=key $2=pane
   [ "$(pane_info "$2" | jq -r '.agent // empty')" = "$DEVLAYOUT_AGENT_NAME" ] && return 0
   pid_alive "$1" agent ""    # the resume command runs under sh, so skip the name check
 }
-editor_alive() { recently_started "$1" editor || pid_alive "$1" editor "$(editor_procname)"; }
+# The built-in nvim also counts as running when it answers on this tab's socket (pid file lost or
+# overwritten, or started by hand with --listen "$(devlayout editor-socket)")
+builtin_nvim() { [ "$DEVLAYOUT_EDITOR" = nvim ] && [ -z "$DEVLAYOUT_EDITOR_CMD" ] && command -v nvim >/dev/null 2>&1; }
+editor_alive() {
+  recently_started "$1" editor || pid_alive "$1" editor "$(editor_procname)" \
+    || { builtin_nvim && nvim_listening "$(sock_of "$1")"; }
+}
 review_alive() { recently_started "$1" review || pid_alive "$1" review "$(first_word "$DEVLAYOUT_REVIEW_CMD")"; }
 
 # ── Before typing: is the shell in the foreground? ─────────
@@ -336,7 +358,15 @@ editor_cmd() {   # $1=key [$2=extra nvim arguments, already quoted] -> shell cod
   fi
 }
 
-start_editor() { start_role "$1" "$2" editor "$(editor_cmd "$2")"; }
+start_editor() {
+  # A second nvim could not --listen on a socket that answers; say so instead of letting it fail
+  if builtin_nvim && nvim_listening "$(sock_of "$2")"; then
+    SKIPPED="$SKIPPED editor(nvim already listening)"
+    say "an nvim for this tab already listens on $(sock_of "$2"); not starting another"
+    return 1
+  fi
+  start_role "$1" "$2" editor "$(editor_cmd "$2")"
+}
 start_review() { start_role "$1" "$2" review "exec $DEVLAYOUT_REVIEW_CMD"; }
 
 # Age of a process in seconds, from `ps -o etime=` ([[DD-]HH:]MM:SS). Empty if unknown.
@@ -440,7 +470,7 @@ build_or_repair() {
   _tab=$1
   _root=${2:-$(tab_root "$_tab")}
   _name=$(basename "$_root")
-  _key=$(proj_key "$_root")
+  _key=$(proj_key "$_root" "$_tab")
   lock "$_key"
   _count=$(panes "$_tab" | jq -s 'length')
   case $_count in
@@ -475,20 +505,20 @@ cmd_open() {
     return
   fi
 
-  _key=$(proj_key "$_root")
-  lock "$_key"
+  lock "$(proj_key "$_root")"    # by path: a repeated run must not create a second workspace
   _out=$(h workspace create --cwd "$_root" --label "$_name" --focus)
   _agent=$(printf '%s\n' "$_out" | jq -r '.result.root_pane.pane_id // empty')
   [ -n "$_agent" ] || die "no pane_id in the output of herdr workspace create (output format changed? check your herdr version)"
+  _ntab=$(printf '%s\n' "$_out" | jq -r '.result.tab.tab_id // .result.root_pane.tab_id // empty')
   say "created workspace '$_name' ($_root)"
-  build "$_agent" "$_root" "$_key" new
+  build "$_agent" "$_root" "$(proj_key "$_root" "$_ntab")" new
 }
 
 cmd_reset() {
   require_herdr
   _tab=$(current_tab)
   _root=$(tab_root "$_tab")
-  _key=$(proj_key "$_root")
+  _key=$(proj_key "$_root" "$_tab")
   lock "$_key"
 
   # The agent pane to keep, within this tab: label -> agent detection -> first pane
@@ -523,7 +553,7 @@ cmd_status() {
   _tab=$(current_tab)
   _root=$(tab_root "$_tab")
   _name=$(basename "$_root")
-  _key=$(proj_key "$_root")
+  _key=$(proj_key "$_root" "$_tab")
   printf 'tab:     %s\nproject: %s (%s)\nkey:     %s\n' "$_tab" "$_name" "$_root" "$_key"
   panes "$_tab" | jq -r '"pane \(.pane_id)  label=\(.label // "-")  agent=\(.agent // "-")  cwd=\(.cwd // "-")"'
   for _r in agent editor review; do
@@ -547,7 +577,7 @@ repair_tab() {
   R=$(pane_by_label "$1" "$DEVLAYOUT_LABEL_REVIEW")
   { [ -n "$A" ] && [ -n "$E" ] && [ -n "$R" ]; } || return 2
   _root=$(tab_root "$1")
-  _key=$(proj_key "$_root")
+  _key=$(proj_key "$_root" "$1")
   lock "$_key"
   # Right after a server start every shell is new and may briefly have a child in front -> wait
   FRESH="$A $E $R"
@@ -609,7 +639,7 @@ cmd_worktree_event() {
   _path=$(evq '.data.worktree.path // .data.workspace.worktree.checkout_path')
   if [ -n "$_path" ] && [ -d "$_path" ]; then _root=$(root_of "$_path"); else _root=$(tab_root "$_tab"); fi
   _name=$(basename "$_root")
-  _key=$(proj_key "$_root")
+  _key=$(proj_key "$_root" "$_tab")
   try_lock "$_key" || return 0
   _count=$(panes "$_tab" | jq -s 'length')
   case $_count in
@@ -624,7 +654,7 @@ cmd_worktree_event() {
   esac
 }
 
-cmd_editor_socket() { sock_of "$(proj_key "$(root_of "${1:-$PWD}")")"; }
+cmd_editor_socket() { sock_of "$(proj_key "$(root_of "${1:-$PWD}")" "$(key_tab)")"; }
 
 nvim_listening() { [ -S "$1" ] && nvim --headless --server "$1" --remote-expr 1 >/dev/null 2>&1; }
 # Open FILE at LINE in the nvim listening on SOCK. $1=sock $2=absolute file $3=line
@@ -640,7 +670,8 @@ cmd_open_file() {
   _file=$1; _line=${2:-1}
   case $_line in ''|*[!0-9]*) _line=1 ;; esac
   case $_file in /*) ;; *) _file=$PWD/$_file ;; esac
-  _s=$(sock_of "$(proj_key "$(root_of "$(dirname "$_file")")")")
+  # This tab's editor (reviewr runs in the same tab); a file of another project finds no socket
+  _s=$(sock_of "$(proj_key "$(root_of "$(dirname "$_file")")" "$(key_tab)")")
   # --headless: reviewr hands its terminal to this command, and with a terminal attached an nvim client
   # starts a TUI whose escape codes would end up in $_esc and be sent to the editor as keys
   if nvim_listening "$_s"; then
@@ -662,8 +693,9 @@ open_in_editor_pane() {
   _ot=$(current_tab)
   _oe=$(pane_by_label "$_ot" "$DEVLAYOUT_LABEL_EDITOR")
   [ -n "$_oe" ] && [ "$_oe" != "$(current_pane)" ] || return 1
-  _ok=$(proj_key "$(tab_root "$_ot")")
-  [ "$(sock_of "$_ok")" = "$3" ] || return 1    # the file belongs to another project
+  _oroot=$(tab_root "$_ot")
+  [ "$_oroot" = "$(root_of "$(dirname "$1")")" ] || return 1    # the file belongs to another project
+  _ok=$(proj_key "$_oroot" "$_ot")
   try_lock "$_ok" || return 1
   start_role "$_oe" "$_ok" editor "$(editor_cmd "$_ok" "$(shq "+$2") $(shq "$1")")" || return 1
   say "opened $1 in the editor pane ($_oe)"
@@ -717,7 +749,7 @@ cmd_state() {
   require_herdr
   _tab=$(current_tab)
   _root=$(tab_root "$_tab")
-  _key=$(proj_key "$_root")
+  _key=$(proj_key "$_root" "$_tab")
   _now=$(focus_now)
   _ft=${_now% *}; _fpn=${_now#* }
   _pl=$(panes "$_tab" | jq -s -c '[.[] | {pane_id, label, agent, agent_status}]')
@@ -805,8 +837,8 @@ cmd_edit() {
   _ep=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_EDITOR")
   [ -n "$_ep" ] || die "no editor pane (label '$DEVLAYOUT_LABEL_EDITOR') in this tab. Build the layout first: run open"
   _troot=$(tab_root "$_tab")
-  _s=$(sock_of "$(proj_key "$_troot")")
-  [ "$(sock_of "$(proj_key "$(root_of "$(dirname "$_file")")")")" = "$_s" ] \
+  _s=$(sock_of "$(proj_key "$_troot" "$_tab")")
+  [ "$(root_of "$(dirname "$_file")")" = "$_troot" ] \
     || die "$_file is not in this tab's project ($_troot)"
   if nvim_listening "$_s"; then
     nvim_drop "$_s" "$_file" "$_line"
