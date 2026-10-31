@@ -15,7 +15,10 @@ First release. Requires herdr 0.9.5 or later (macOS, Linux).
 - Agent resume with `claude --continue`, falling back to a new session when there is nothing to resume.
   Leaves the agent pane alone while herdr resumes the agent itself after a server restart.
 - Projects are keyed by path, so two projects with the same folder name never share state or an editor socket.
-- `open-file` opens a file in the layout's nvim, for reviewr's `editor` setting.
+- `open-file` opens a file in the layout's nvim, for reviewr's `editor` setting. If that nvim was quit, it is
+  started again in the editor pane with the file instead of taking over the reviewr pane.
+- A program that quits right after it was started is restarted by the next open (before, it counted as
+  running for 15 seconds).
 - Optional automatic repair at herdr server start (`DEVLAYOUT_STARTUP=1`).
 - Optional layout for new worktree workspaces (`DEVLAYOUT_WORKTREE=1`).
 - Errors and skipped roles are shown as a herdr notification when run from a key binding, action or hook.

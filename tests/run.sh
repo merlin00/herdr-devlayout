@@ -564,6 +564,73 @@ sent=$(grep -- '--remote-send' "$NVIM_LOG")
 check "open-file sends a clean :drop to the editor" '[ $rc -eq 0 ] && printf %s "$sent" | grep -qF ":drop $PROJ/a.txt<CR>:7<CR>" && ! printf %s "$sent" | grep -q "$(printf "\033")"'
 check "every nvim client call is headless" '! grep -v -- --headless "$NVIM_LOG" | grep -q .'
 
+# ── the editor's nvim was quit by mistake ──
+nlines() { runs_for "$1" | grep -c . ; }
+editor_pid() { printf '%s/run/%s.editor.pid\n' "$HERDR_PLUGIN_STATE_DIR" "$(key_of "$PROJ")"; }
+
+# T53 quit right after start (within the cooldown): the pid file's process is gone -> start it again
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"
+"$DL" >/dev/null 2>&1
+sh -c 'exit 0' & dead=$!; wait "$dead"
+echo "$dead" >"$(editor_pid)"
+out=$("$DL" 2>&1)
+check "quit within the cooldown -> editor typed again" '[ "$(nlines w1:p3)" = 2 ] && printf %s "$out" | grep -q "restarted: editor"'
+check "quit within the cooldown -> review (still starting) not typed again" '[ "$(nlines w1:p2)" = 1 ]'
+
+# T54 within the cooldown, the program is still running -> nothing typed
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"
+"$DL" >/dev/null 2>&1
+sleep 30 & live=$!
+echo "$live" >"$(editor_pid)"
+out=$("$DL" 2>&1)
+check "within the cooldown, editor alive -> not typed again" '[ "$(nlines w1:p3)" = 1 ]'
+stop_bg "$live"
+
+# T55 a stale pid file is removed before typing, so the new start is not judged by it
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"
+mkdir -p "$HERDR_PLUGIN_STATE_DIR/run"
+sh -c 'exit 0' & dead=$!; wait "$dead"
+echo "$dead" >"$(editor_pid)"
+"$DL" >/dev/null 2>&1
+out=$("$DL" 2>&1)
+check "old pid file -> removed when typing, second press types nothing" '[ "$(nlines w1:p3)" = 1 ] && [ ! -f "$(editor_pid)" ]'
+
+# T56 reviewr e while the editor pane is a shell -> nvim starts in the editor pane with the file
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+rm -f "$("$DL" editor-socket "$PROJ")"
+echo x >"$PROJ/a.txt"
+out=$(HERDR_PANE_ID=w1:p2 PATH="$T/bin:$PATH" "$DL" open-file "$PROJ/a.txt" 7 2>&1); rc=$?
+check "open-file, no editor -> started in the editor pane" '[ $rc -eq 0 ] && runs_for w1:p3 | grep -q "nvim --listen" && runs_for w1:p3 | grep -qF "+7" && runs_for w1:p3 | grep -qF "a.txt"'
+check "open-file, no editor -> nvim not run in the reviewr pane" '! grep -qF "+7" "$NVIM_LOG" 2>/dev/null && [ -z "$(runs_for w1:p2)" ]'
+check "open-file, no editor -> typed text is valid shell" 'all_runs_parse'
+
+# T57 the editor pane is busy -> open the file right here (in the reviewr pane), type nothing
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+rm -f "$("$DL" editor-socket "$PROJ")"
+set_pane w1:p3 fg '"vim"'
+echo x >"$PROJ/a.txt"
+out=$(HERDR_PANE_ID=w1:p2 PATH="$T/bin:$PATH" "$DL" open-file "$PROJ/a.txt" 7 2>&1); rc=$?
+check "open-file, editor pane busy -> nvim here, nothing typed" '[ $rc -eq 0 ] && grep -qF "+7 $PROJ/a.txt" "$NVIM_LOG" && [ "$(nruns)" = 0 ]'
+
+# T58 outside herdr -> open the file right here
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+rm -f "$("$DL" editor-socket "$PROJ")"
+echo x >"$PROJ/a.txt"
+out=$(env -u HERDR_ENV -u HERDR_PANE_ID PATH="$T/bin:$PATH" "$DL" open-file "$PROJ/a.txt" 7 2>&1); rc=$?
+check "open-file outside herdr -> nvim here" '[ $rc -eq 0 ] && grep -qF "+7 $PROJ/a.txt" "$NVIM_LOG" && [ "$(nruns)" = 0 ]'
+
+# T59 a file from another project -> not opened in this tab's editor
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+mkdir -p "$T/other"; echo x >"$T/other/b.txt"
+out=$(HERDR_PANE_ID=w1:p2 PATH="$T/bin:$PATH" "$DL" open-file "$T/other/b.txt" 3 2>&1); rc=$?
+check "open-file, other project -> nvim here, nothing typed" '[ $rc -eq 0 ] && grep -qF "+3 $T/other/b.txt" "$NVIM_LOG" && [ "$(nruns)" = 0 ]'
+
+# T60 nvim started by hand in the editor pane -> the skip message says how to make it receive files
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"
+set_pane w1:p3 fg '"nvim"'
+out=$("$DL" 2>&1)
+check "hand-started nvim in the editor pane -> hint about --listen" 'printf %s "$out" | grep -qF "nvim --listen \"\$(devlayout editor-socket)\""'
+
 echo
 echo "result: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

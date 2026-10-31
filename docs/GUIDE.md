@@ -110,7 +110,9 @@ editor = "devlayout open-file {file} {line}"
 ```
 
 Now pressing `e` on a file in reviewr opens it at that line in the layout's nvim (bottom left), and reviewr
-keeps the focus. If the editor pane's nvim is not running, the file opens in nvim inside the reviewr pane.
+keeps the focus. If you quit the editor pane's nvim, `e` starts it again in the editor pane with that file.
+Only when the editor pane is busy with another program (or the file belongs to another project) does the
+file open in nvim inside the reviewr pane; quit that nvim to get reviewr back.
 
 If you start nvim yourself and want it to receive these files, start it with
 `nvim --listen "$(devlayout editor-socket)"`.
@@ -147,9 +149,11 @@ functions are not available there; use command names on your PATH or absolute pa
   a three-pane layout tab. Use `prefix` → `Shift+L`, or open a new tab.
 - **"skipped: editor(nvim)"** (or another role): a program is already running in that pane. Quit it and
   run open again.
-- **reviewr's `e` opens nvim in the reviewr pane** instead of the editor pane: the editor pane's nvim was not
-  started by devlayout. Restart it with `prefix` → `Shift+O` after quitting it, or use
-  `nvim --listen "$(devlayout editor-socket)"`.
+- **reviewr's `e` opens nvim in the reviewr pane** instead of the editor pane: another program is running in
+  the editor pane, often an nvim you started yourself, which cannot receive files. Quit it and press `e` again,
+  or start your own nvim with `nvim --listen "$(devlayout editor-socket)"`.
+- **I quit nvim by mistake.** Press `prefix` → `Shift+O` (or just press `e` in reviewr). Changes you had not
+  saved are gone after `:q!`; after a crash or a killed pane, nvim offers to recover them from its swap file.
 
 ## Uninstall
 

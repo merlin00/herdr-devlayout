@@ -109,8 +109,9 @@ editor = "devlayout open-file {file} {line}"
 
 reviewr runs this without a shell, so `devlayout` must be on your `PATH` (see Install), or give the full path:
 `editor = "sh /path/to/herdr-devlayout/bin/devlayout open-file {file} {line}"`. reviewr passes an absolute path,
-and hands its pane to the command until it exits; `open-file` returns at once when the editor pane's nvim is
-running (otherwise it opens nvim right there in the reviewr pane).
+and hands its pane to the command until it exits; `open-file` returns at once: it opens the file in the editor pane's nvim,
+or starts that nvim with the file if it was quit. Only if the editor pane is busy with another program does
+it open nvim right there in the reviewr pane.
 
 ## Configuration
 

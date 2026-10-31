@@ -200,11 +200,19 @@ tab_root() {
 pidf() { printf '%s/run/%s.%s.pid\n' "$STATE_DIR" "$1" "$2"; }     # $1=project key $2=role
 mark() { printf '%s/run/%s.%s.started\n' "$STATE_DIR" "$1" "$2"; }
 
+# Started less than COOLDOWN seconds ago. start_role removes the old pid file before typing, so a pid
+# file here was written by this start: if its process is already gone, the program quit right after
+# starting and counts as stopped. No pid file yet = the shell has not run the command yet.
 recently_started() {
   _m=$(mark "$1" "$2")
   [ -f "$_m" ] || return 1
   _t=$(cat "$_m" 2>/dev/null || echo 0)
-  [ $(( $(now) - _t )) -lt "$DEVLAYOUT_COOLDOWN" ]
+  [ $(( $(now) - _t )) -lt "$DEVLAYOUT_COOLDOWN" ] || return 1
+  _f=$(pidf "$1" "$2")
+  [ -f "$_f" ] || return 0
+  _rp=$(cat "$_f" 2>/dev/null) || return 0
+  case $_rp in ''|*[!0-9]*) return 0 ;; esac
+  kill -0 "$_rp" 2>/dev/null
 }
 
 # $1=key $2=role $3=expected process name (empty: skip the name check)
@@ -266,6 +274,9 @@ shell_ready() {
           *" $1 "*) ;;   # new pane: keep waiting
           *) SKIPPED="$SKIPPED $2(${_fs#busy })"
              say "$2 pane ($1) is running ${_fs#busy }; not typing into it. Leave it if you started it yourself, otherwise quit it and run open again"
+             if [ "$2" = editor ] && [ "${_fs#busy }" = nvim ] && [ "$DEVLAYOUT_EDITOR" = nvim ] && [ -z "$DEVLAYOUT_EDITOR_CMD" ]; then
+               say "to let reviewr open files in it, start it with: nvim --listen \"\$(devlayout editor-socket)\""
+             fi
              return 1 ;;
         esac ;;
     esac
@@ -290,6 +301,8 @@ run_in() {
 # $1=pane $2=key $3=role $4=shell code (must end with exec so the pid file holds the program's pid).
 # Leaves no cooldown mark when nothing was typed, so the next run decides again.
 start_role() {
+  shell_ready "$1" "$3" || return 1
+  rm -f "$(pidf "$2" "$3")"    # the role is stopped, so this pid is stale (see recently_started)
   run_in "$1" "$3" "echo \$\$ > $(shq "$(pidf "$2" "$3")"); $4" || return 1
   now >"$(mark "$2" "$3")"
 }
@@ -300,13 +313,13 @@ editor_procname() {   # editor process name, for the running check
   if [ -n "$DEVLAYOUT_EDITOR_CMD" ]; then first_word "$DEVLAYOUT_EDITOR_CMD"; else first_word "$DEVLAYOUT_EDITOR"; fi
 }
 
-editor_cmd() {   # $1=key -> shell code that starts the editor (ends with exec)
+editor_cmd() {   # $1=key [$2=extra nvim arguments, already quoted] -> shell code that starts the editor (ends with exec)
   if [ -n "$DEVLAYOUT_EDITOR_CMD" ]; then printf 'exec %s' "$DEVLAYOUT_EDITOR_CMD"; return; fi
   if [ "$DEVLAYOUT_EDITOR" = nvim ]; then
     _s=$(shq "$(sock_of "$1")")
     # A dead socket file makes --listen fail, so remove it. A live socket is left alone.
-    printf 'mkdir -p %s; if [ -S %s ] && ! nvim --headless --server %s --remote-expr 1 >/dev/null 2>&1; then rm -f %s; fi; exec nvim --listen %s' \
-      "$(shq "$DEVLAYOUT_SOCKET_DIR")" "$_s" "$_s" "$_s" "$_s"
+    printf 'mkdir -p %s; if [ -S %s ] && ! nvim --headless --server %s --remote-expr 1 >/dev/null 2>&1; then rm -f %s; fi; exec nvim --listen %s%s' \
+      "$(shq "$DEVLAYOUT_SOCKET_DIR")" "$_s" "$_s" "$_s" "$_s" "${2:+ $2}"
   else
     printf 'exec %s' "$DEVLAYOUT_EDITOR"
   fi
@@ -616,8 +629,27 @@ cmd_open_file() {
     _esc=$(nvim --headless --server "$_s" --remote-expr "fnameescape('$(printf '%s' "$_file" | sed "s/'/''/g")')")
     nvim --headless --server "$_s" --remote-send "<C-\\><C-N>:drop $_esc<CR>:$_line<CR>zz"
   else
+    # No editor listening: start it in this tab's editor pane with the file, if that pane shows a shell.
+    # A subshell, so that any failure (die) falls back to opening the file right here.
+    if ( open_in_editor_pane "$_file" "$_line" "$_s" ); then exit 0; fi
     exec nvim "+$_line" "$_file"
   fi
+}
+
+# $1=file $2=line $3=socket of the file's project. Returns 0 if nvim was started in the editor pane.
+open_in_editor_pane() {
+  [ "${HERDR_ENV:-}" = 1 ] || return 1
+  [ "$DEVLAYOUT_EDITOR" = nvim ] && [ -z "$DEVLAYOUT_EDITOR_CMD" ] || return 1
+  command -v "$HERDR" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+  SKIPPED=; DEVLAYOUT_NOTIFY=off    # this is only an attempt; the fallback below still opens the file
+  _ot=$(current_tab)
+  _oe=$(pane_by_label "$_ot" "$DEVLAYOUT_LABEL_EDITOR")
+  [ -n "$_oe" ] && [ "$_oe" != "$(current_pane)" ] || return 1
+  _ok=$(proj_key "$(tab_root "$_ot")")
+  [ "$(sock_of "$_ok")" = "$3" ] || return 1    # the file belongs to another project
+  try_lock "$_ok" || return 1
+  start_role "$_oe" "$_ok" editor "$(editor_cmd "$_ok" "$(shq "+$2") $(shq "$1")")" || return 1
+  say "opened $1 in the editor pane ($_oe)"
 }
 
 usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
