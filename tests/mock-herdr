@@ -6,8 +6,11 @@ Output shapes follow the real herdr 0.9.5 CLI (checked 2026-10-30):
   workspace create -> .result.root_pane / .workspace / .tab,  pane split -> .result.pane (the new pane only)
 Update this file when the real output changes.
 
-Supports: workspace list|create|get|focus, pane list|get|split|rename|run|close|process-info,
-          notification show, status server
+Supports: workspace list|create|get|focus, pane list|get|split|rename|run|close|process-info|neighbor|focus,
+          api snapshot, plugin pane open, notification show, status server
+The focused pane is the one with "focused": true (api snapshot reports it and its tab).
+Neighbours: state["neighbors"][pane][direction] if given, otherwise the devlayout geometry from the labels
+(claude top left, nvim bottom left, reviewr right; checked on real 0.9.5, 2026-10-31).
 Pane ids look like herdr's "<ws>:p<n>" (n in the base-32 DIGITS below), tab ids "<ws>:t<n>".
 Closed pane ids are never reused and the remaining ids never change (as in herdr).
 Text typed with `pane run` is recorded in state["runs"].
@@ -70,6 +73,17 @@ def opt(args, name, default=None):
         i = args.index(name)
         return args[i + 1]
     return default
+
+
+def neighbor(s, pid, d):
+    given = s.get("neighbors")
+    if given is not None:
+        return given.get(pid, {}).get(d)
+    by = {p["label"]: p["pane_id"] for p in s["panes"] if p.get("label") and p["tab_id"] == find_pane(s, pid)["tab_id"]}
+    role = find_pane(s, pid).get("label")
+    geo = {"claude": {"down": "nvim", "right": "reviewr"}, "nvim": {"up": "claude", "right": "reviewr"},
+           "reviewr": {"left": "claude"}}
+    return by.get(geo.get(role, {}).get(d))
 
 
 def main(argv):
@@ -181,11 +195,46 @@ def main(argv):
             find_pane(s, rest[0])
             s["runs"].append({"pane": rest[0], "text": rest[1]})
             save(s)
+        elif cmd == "neighbor":
+            pid, d = opt(rest, "--pane"), opt(rest, "--direction")
+            nb = {"pane_id": pid, "direction": d}
+            n = neighbor(s, pid, d)
+            if n:
+                nb["neighbor_pane_id"] = n
+            out({"type": "pane_neighbor", "neighbor": nb})
+        elif cmd == "focus":
+            pid, d = opt(rest, "--pane"), opt(rest, "--direction")
+            n = neighbor(s, pid, d)
+            if not n:
+                fail('{"error":{"code":"no_neighbor","message":"no pane in that direction"}}')
+            for p in s["panes"]:
+                p["focused"] = p["pane_id"] == n
+            s.setdefault("focus_log", []).append(n)
+            save(s)
+            out({"type": "pane_focus", "focus": {"changed": True, "focused_pane_id": n}})
         elif cmd == "close":
             s["panes"].remove(find_pane(s, rest[0]))   # remaining ids stay as they are
             save(s)
         else:
             fail(f"unknown pane cmd {cmd}", 2)
+        return
+
+    if grp == "api" and cmd == "snapshot":
+        f = [p for p in s["panes"] if p.get("focused")]
+        f = f[0] if f else {}
+        out({"type": "session_snapshot", "snapshot": {
+            "focused_workspace_id": f.get("workspace_id"), "focused_tab_id": f.get("tab_id"),
+            "focused_pane_id": f.get("pane_id"), "panes": s["panes"]}})
+        return
+
+    if grp == "plugin" and cmd == "pane" and rest[:1] == ["open"]:
+        # MOCK_PLUGIN_ERR=<code> fails like real herdr (JSON error on stderr, exit 1), e.g. ui_busy
+        err = os.environ.get("MOCK_PLUGIN_ERR")
+        if err:
+            fail(json.dumps({"error": {"code": err, "message": err}, "id": "cli:plugin"}))
+        s.setdefault("plugin_opens", []).append(rest[1:])
+        save(s)
+        out({"type": "ok"})   # what real 0.9.5 returns for a popup
         return
 
     if grp == "notification" and cmd == "show":

@@ -14,6 +14,12 @@
 #   devlayout status          Show panes and program state of the current tab
 #   devlayout open-file FILE [LINE]   Open FILE in the resident editor (nvim socket); for reviewr's editor setting
 #   devlayout editor-socket [DIR]     Print the nvim socket path of project DIR
+#   devlayout state           Print the current tab as JSON: role panes, program states, where the user looks
+#   devlayout focus ROLE [MESSAGE]    Move the focus to the agent, editor or review pane of this tab
+#                             (only if the user is looking at this tab; otherwise show MESSAGE as a notification)
+#   devlayout show FILE[:LINE[-END]]  Show FILE in a herdr-file-viewer popup, at LINE or the range
+#   devlayout edit FILE [LINE]        Open FILE in the editor pane's nvim and focus that pane
+#   devlayout install-skill   Link the bundled Claude Code skill into ~/.claude/skills/devlayout
 #   devlayout repair-all      In every tab that has the devlayout layout, restart stopped editor/review
 #                             (and agent if DEVLAYOUT_STARTUP_AGENT=1). Never builds, relabels or closes panes
 #   devlayout startup         Run by herdr after a server restart; does repair-all if DEVLAYOUT_STARTUP=1
@@ -30,10 +36,12 @@ set -eu
 VERSION=0.1.0
 
 # ── Paths and defaults ──────────────────────────────────────
-# When run as a plugin, herdr provides HERDR_BIN_PATH and HERDR_PLUGIN_*_DIR.
+# When run as a plugin, herdr provides HERDR_BIN_PATH and HERDR_PLUGIN_*_DIR. Run from a pane shell
+# (by hand, by an agent or by reviewr), use the same folders, so settings and pid files are shared.
 HERDR=${HERDR_BIN_PATH:-herdr}
-STATE_DIR=${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/devlayout}
-CONFIG_DIR=${HERDR_PLUGIN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/devlayout}
+PLUGIN_ID=merlin00.devlayout
+STATE_DIR=${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$PLUGIN_ID}
+CONFIG_DIR=${HERDR_PLUGIN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/plugins/config/$PLUGIN_ID}
 LOG=$STATE_DIR/devlayout.log
 
 # Defaults; override them in $CONFIG_DIR/config.env (see config.example.env).
@@ -55,6 +63,8 @@ DEVLAYOUT_SHELL_WAIT=5                      # wait up to this many seconds for a
 DEVLAYOUT_LABEL_AGENT=claude                # pane labels (herdr pane label)
 DEVLAYOUT_LABEL_EDITOR=nvim
 DEVLAYOUT_LABEL_REVIEW=reviewr
+DEVLAYOUT_FOCUS=auto                        # focus/show/edit move the focus: auto (only while the user looks at the tab) | off
+DEVLAYOUT_VIEWER=herdr-file-viewer          # plugin id of the file viewer used by show
 if [ -f "$CONFIG_DIR/config.env" ]; then
   # shellcheck disable=SC1091
   . "$CONFIG_DIR/config.env"
@@ -615,6 +625,14 @@ cmd_worktree_event() {
 
 cmd_editor_socket() { sock_of "$(proj_key "$(root_of "${1:-$PWD}")")"; }
 
+nvim_listening() { [ -S "$1" ] && nvim --headless --server "$1" --remote-expr 1 >/dev/null 2>&1; }
+# Open FILE at LINE in the nvim listening on SOCK. $1=sock $2=absolute file $3=line
+nvim_drop() {
+  # fnameescape keeps paths with spaces and special characters safe
+  _esc=$(nvim --headless --server "$1" --remote-expr "fnameescape('$(printf '%s' "$2" | sed "s/'/''/g")')")
+  nvim --headless --server "$1" --remote-send "<C-\\><C-N>:drop $_esc<CR>:$3<CR>zz"
+}
+
 # For reviewr's editor setting: open in the resident nvim if there is one, otherwise in this pane
 cmd_open_file() {
   [ -n "${1:-}" ] || die "usage: devlayout open-file FILE [LINE]"
@@ -624,10 +642,8 @@ cmd_open_file() {
   _s=$(sock_of "$(proj_key "$(root_of "$(dirname "$_file")")")")
   # --headless: reviewr hands its terminal to this command, and with a terminal attached an nvim client
   # starts a TUI whose escape codes would end up in $_esc and be sent to the editor as keys
-  if [ -S "$_s" ] && nvim --headless --server "$_s" --remote-expr 1 >/dev/null 2>&1; then
-    # fnameescape keeps paths with spaces and special characters safe
-    _esc=$(nvim --headless --server "$_s" --remote-expr "fnameescape('$(printf '%s' "$_file" | sed "s/'/''/g")')")
-    nvim --headless --server "$_s" --remote-send "<C-\\><C-N>:drop $_esc<CR>:$_line<CR>zz"
+  if nvim_listening "$_s"; then
+    nvim_drop "$_s" "$_file" "$_line"
   else
     # No editor listening: start it in this tab's editor pane with the file, if that pane shows a shell.
     # A subshell, so that any failure (die) falls back to opening the file right here.
@@ -652,7 +668,181 @@ open_in_editor_pane() {
   say "opened $1 in the editor pane ($_oe)"
 }
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+# ── For agent skills and hooks: state, focus, show, edit ────
+role_label() {
+  case ${1:-} in
+    agent) printf '%s\n' "$DEVLAYOUT_LABEL_AGENT" ;;
+    editor) printf '%s\n' "$DEVLAYOUT_LABEL_EDITOR" ;;
+    review) printf '%s\n' "$DEVLAYOUT_LABEL_REVIEW" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Where the user looks: "<focused tab> <focused pane>" from herdr api snapshot (0.9.5)
+focus_now() { h api snapshot | jq -r '.result.snapshot | "\(.focused_tab_id // "-") \(.focused_pane_id // "-")"'; }
+
+# Tell the user without moving anything: a line here and a herdr notification (unless DEVLAYOUT_NOTIFY=off)
+attention() {
+  say "$2"
+  [ "${DEVLAYOUT_NOTIFY:-auto}" = off ] || "$HERDR" notification show "$1" --body "$2" >/dev/null 2>&1 || :
+}
+
+# 0 if focus may move in tab $1: allowed by DEVLAYOUT_FOCUS and the user looks at that tab.
+# Moving the focus to a pane of another tab would switch the user's screen to it (seen on 0.9.5).
+may_focus() {
+  [ "$DEVLAYOUT_FOCUS" != off ] || return 1
+  [ "$(focus_now | cut -d' ' -f1)" = "$1" ]
+}
+
+# Focus pane $2 of tab $1. The CLI focuses only by direction from a pane, so find a pane whose
+# neighbour in some direction is the target.
+focus_pane() {
+  [ "$(focus_now | cut -d' ' -f2)" != "$2" ] || return 0
+  for _fp in $(panes "$1" | jq -r --arg p "$2" 'select(.pane_id != $p) | .pane_id'); do
+    for _d in left right up down; do
+      _n=$(h pane neighbor --direction "$_d" --pane "$_fp" | jq -r '.result.neighbor.neighbor_pane_id // empty')
+      if [ "$_n" = "$2" ]; then h pane focus --direction "$_d" --pane "$_fp" >/dev/null; return 0; fi
+    done
+  done
+  return 1
+}
+
+# $1=tab $2=pane $3=role $4=message shown instead when the focus may not move
+focus_role() {
+  if ! may_focus "$1"; then attention "devlayout: $3" "$4"; return 0; fi
+  focus_pane "$1" "$2" || die "could not move the focus to the $3 pane ($2): no neighbouring pane leads to it. Check the layout with status"
+  say "focused the $3 pane ($2)"
+}
+
+cmd_state() {
+  require_herdr
+  _tab=$(current_tab)
+  _root=$(tab_root "$_tab")
+  _key=$(proj_key "$_root")
+  _now=$(focus_now)
+  _ft=${_now% *}; _fpn=${_now#* }
+  _pl=$(panes "$_tab" | jq -s -c '[.[] | {pane_id, label, agent, agent_status}]')
+  _roles='{}'
+  for _r in agent editor review; do
+    _p=$(pane_by_label "$_tab" "$(role_label "$_r")")
+    if [ -z "$_p" ]; then _st=missing
+    else
+      case $_r in
+        agent) if agent_alive "$_key" "$_p"; then _st=running; else _st=stopped; fi ;;
+        editor) if editor_alive "$_key"; then _st=running; else _st=stopped; fi ;;
+        review) if review_alive "$_key"; then _st=running; else _st=stopped; fi ;;
+      esac
+      # A stopped role with another program in front is "busy <program>": open would skip it
+      if [ "$_st" = stopped ]; then _f=$(fg_state "$_p"); case $_f in busy\ *) _st=$_f ;; esac; fi
+    fi
+    _roles=$(printf '%s\n' "$_roles" | jq -c --arg r "$_r" --arg p "$_p" --arg s "$_st" '.[$r] = {pane: (if $p == "" then null else $p end), state: $s}')
+  done
+  jq -n --arg tab "$_tab" --arg root "$_root" --arg key "$_key" --arg ft "$_ft" --arg fp "$_fpn" \
+    --arg sock "$(sock_of "$_key")" --argjson panes "$_pl" --argjson roles "$_roles" '
+    ($roles | to_entries | map(select(.value.pane == $fp)) | first // {} | .key // null) as $fr
+    | ($panes | length) as $n
+    | {tab: $tab, project: $root, key: $key,
+       layout: (if $n == 1 then "single"
+                elif $n == 3 and ([$roles[] | select(.pane != null)] | length) == 3 then "devlayout"
+                else "other" end),
+       viewing: ($ft == $tab), focused_pane: (if $fp == "-" then null else $fp end), focused_role: $fr,
+       roles: $roles, panes: $panes, editor_socket: $sock}'
+}
+
+cmd_focus() {
+  require_herdr
+  _lb=$(role_label "${1:-}") || die "usage: devlayout focus agent|editor|review [MESSAGE]"
+  _tab=$(current_tab)
+  _tp=$(pane_by_label "$_tab" "$_lb")
+  [ -n "$_tp" ] || die "no $1 pane (label '$_lb') in this tab. Build the layout first: run open"
+  focus_role "$_tab" "$_tp" "$1" "${2:-Claude asks you to look at the $1 pane}"
+}
+
+# Absolute physical path of a file whose directory exists. $1=path (relative to $PWD)
+abs_path() {
+  case $1 in /*) _ap=$1 ;; *) _ap=$PWD/$1 ;; esac
+  printf '%s/%s\n' "$(cd "$(dirname "$_ap")" 2>/dev/null && pwd -P)" "$(basename "$_ap")"
+}
+
+cmd_show() {
+  require_herdr
+  [ -n "${1:-}" ] || die "usage: devlayout show FILE[:LINE[-END]]"
+  _sf=$1; _sl=
+  # A trailing :N or :N-M is a line or range; any other colon belongs to the file name
+  case $1 in
+    *:*) _x=${1##*:}
+         case $_x in ''|*[!0-9-]*|-*|*-|*-*-*) ;; *) _sl=$_x; _sf=${1%:*} ;; esac ;;
+  esac
+  [ -f "$_sf" ] || die "no such file: $_sf"
+  _sf=$(abs_path "$_sf")
+  _tab=$(current_tab)
+  # Root the viewer at this tab's project when the file is in it, otherwise at the file's own project
+  _root=$(tab_root "$_tab")
+  case $_sf in "$_root"/*) ;; *) _root=$(root_of "$(dirname "$_sf")") ;; esac
+  _rel=${_sf#"$_root"/}
+  _target=$_rel${_sl:+:$_sl}
+  if ! may_focus "$_tab"; then attention "devlayout: show" "Claude wants to show you $_target"; return 0; fi
+  _o=$("$HERDR" plugin pane open --plugin "$DEVLAYOUT_VIEWER" --entrypoint file-viewer --placement popup --focus \
+        --env "HERDR_FILE_VIEWER_ROOT=$_root" --env "HERDR_FILE_VIEWER_OPEN=$_target" 2>&1) || {
+    case $_o in
+      *ui_busy*) die "a popup is already open. Close it (q) and try again" ;;
+      *plugin_not_found*) die "the file viewer plugin '$DEVLAYOUT_VIEWER' is not installed. Install it: herdr plugin install smarzban/herdr-file-viewer" ;;
+      *) die "herdr plugin pane open failed: $_o" ;;
+    esac
+  }
+  say "showing $_target in the file viewer (close it with q)"
+}
+
+cmd_edit() {
+  require_herdr
+  [ -n "${1:-}" ] || die "usage: devlayout edit FILE [LINE]"
+  _line=${2:-1}
+  case $_line in ''|*[!0-9]*) die "LINE must be a number: $_line" ;; esac
+  [ -d "$(dirname "$1")" ] || die "no such directory: $(dirname "$1")"
+  _file=$(abs_path "$1")
+  [ "$DEVLAYOUT_EDITOR" = nvim ] && [ -z "$DEVLAYOUT_EDITOR_CMD" ] \
+    || die "edit needs the built-in nvim editor (DEVLAYOUT_EDITOR=nvim and no DEVLAYOUT_EDITOR_CMD)"
+  _tab=$(current_tab)
+  _ep=$(pane_by_label "$_tab" "$DEVLAYOUT_LABEL_EDITOR")
+  [ -n "$_ep" ] || die "no editor pane (label '$DEVLAYOUT_LABEL_EDITOR') in this tab. Build the layout first: run open"
+  _troot=$(tab_root "$_tab")
+  _s=$(sock_of "$(proj_key "$_troot")")
+  [ "$(sock_of "$(proj_key "$(root_of "$(dirname "$_file")")")")" = "$_s" ] \
+    || die "$_file is not in this tab's project ($_troot)"
+  if nvim_listening "$_s"; then
+    nvim_drop "$_s" "$_file" "$_line"
+    say "opened $_file in the editor ($_ep)"
+  elif ( open_in_editor_pane "$_file" "$_line" "$_s" ); then :
+  else
+    die "could not open $_file: the editor pane ($_ep) runs another program or another devlayout run is in progress. Quit that program or run open, then try again"
+  fi
+  focus_role "$_tab" "$_ep" editor "Claude opened $(basename "$_file") in the editor pane"
+}
+
+# Link the bundled skill into Claude Code's skills folder. Never replaces something that is not a link.
+cmd_install_skill() {
+  _here=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd -P)
+  _src=
+  for _c in "${HERDR_PLUGIN_ROOT:-}" "$_here"; do
+    if [ -n "$_c" ] && [ -f "$_c/skills/devlayout/SKILL.md" ]; then _src=$_c/skills/devlayout; break; fi
+  done
+  # Run through a PATH link ($0 is the link): ask herdr where the plugin lives
+  if [ -z "$_src" ] && command -v "$HERDR" >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    _c=$("$HERDR" plugin list --json 2>/dev/null | jq -r --arg id "$PLUGIN_ID" '.result.plugins[]? | select(.plugin_id == $id) | .plugin_root' 2>/dev/null) || _c=
+    if [ -n "$_c" ] && [ -f "$_c/skills/devlayout/SKILL.md" ]; then _src=$_c/skills/devlayout; fi
+  fi
+  [ -n "$_src" ] || die "could not find the bundled skill (skills/devlayout/SKILL.md). Run it from the plugin folder: sh bin/devlayout install-skill"
+  _dst=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/devlayout
+  if [ -e "$_dst" ] && [ ! -L "$_dst" ]; then
+    die "$_dst already exists and is not a link. Move it away first, then run install-skill again"
+  fi
+  mkdir -p "$(dirname "$_dst")"
+  rm -f "$_dst"
+  ln -s "$_src" "$_dst"
+  say "linked the Claude Code skill: $_dst -> $_src (start a new Claude session to load it)"
+}
+
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   _cmd=${1:-open}
@@ -666,6 +856,11 @@ main() {
     worktree-event)       cmd_worktree_event ;;
     open-file)            cmd_open_file "$@" ;;
     editor-socket)        cmd_editor_socket "${1:-}" ;;
+    state)                cmd_state ;;
+    focus)                cmd_focus "$@" ;;
+    show)                 cmd_show "$@" ;;
+    edit)                 cmd_edit "$@" ;;
+    install-skill)        cmd_install_skill ;;
     help|-h|--help)       usage ;;
     version|--version)    printf 'devlayout %s\n' "$VERSION" ;;
     -*)                   die "unknown option: $_cmd (see devlayout help)" ;;

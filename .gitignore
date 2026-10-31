@@ -4,3 +4,4 @@
 # private development notes (kept in a separate private repository)
 /.internal/
 /CLAUDE.md
+/.claude/settings.local.json

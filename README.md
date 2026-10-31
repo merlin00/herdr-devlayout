@@ -23,8 +23,8 @@ A [herdr](https://herdr.dev) plugin that builds and maintains a 3-pane coding la
 
 Step-by-step walkthrough (install, first run, settings, troubleshooting): [docs/GUIDE.md](docs/GUIDE.md).
 
-> Status: 0.1.0, not yet released. Tested with herdr 0.9.5 on macOS (zsh, bash) and against a fake herdr CLI
-> in CI. Linux and fish have not been tried on a real herdr yet.
+> Status: 0.1.0, not yet released. Tested with herdr 0.9.5 on macOS (zsh, bash, fish) and against a fake herdr
+> CLI in CI. Linux has not been tried on a real herdr yet.
 
 ## Requirements
 
@@ -32,6 +32,7 @@ Step-by-step walkthrough (install, first run, settings, troubleshooting): [docs/
 - `jq`
 - The programs you put in the layout. Defaults: [Claude Code](https://code.claude.com), `nvim`,
   [herdr-reviewr](https://github.com/persiyanov/herdr-reviewr)
+- Optional, for `devlayout show`: [herdr-file-viewer](https://github.com/smarzban/herdr-file-viewer)
 
 ## Install
 
@@ -113,6 +114,22 @@ and hands its pane to the command until it exits; `open-file` returns at once: i
 or starts that nvim with the file if it was quit. Only if the editor pane is busy with another program does
 it open nvim right there in the reviewr pane.
 
+### Let Claude guide you to the right pane (optional)
+
+Commands an agent (or a hook) can run from its pane:
+
+| Command | What it does |
+|---|---|
+| `devlayout state` | print this tab as JSON: role panes, which programs run, whether you look at this tab |
+| `devlayout focus agent\|editor\|review [MESSAGE]` | move the focus to that pane |
+| `devlayout show FILE[:LINE[-END]]` | open FILE in a herdr-file-viewer popup at that line or range (close with `q`) |
+| `devlayout edit FILE [LINE]` | open FILE in the editor pane's nvim (starting it if it was quit) and focus that pane |
+
+They only move the focus while you look at the layout tab; otherwise they show a herdr notification
+(`DEVLAYOUT_FOCUS=off` turns focus changes off). `devlayout install-skill` links the bundled Claude Code skill
+(`skills/devlayout`) into `~/.claude/skills`, so Claude knows when to use them. See the
+[guide](docs/GUIDE.md#7-let-claude-guide-you-to-the-right-pane) for hooks.
+
 ## Configuration
 
 Copy `config.example.env` to `$(herdr plugin config-dir merlin00.devlayout)/config.env` and edit.
@@ -141,6 +158,8 @@ use real commands or absolute paths.
   process (`herdr pane process-info`) before typing and skips the pane if anything other than the shell
   is in front ("skipped: editor(nvim)"). Quit that program and run open again to start the role.
 - Running the layout for the **same project** in two tabs at once shares one set of state and one editor socket.
+- Moving or renaming the project folder changes its key: an nvim started before the move keeps the old socket
+  and no longer receives files. Quit it and run open.
 - If you restart the herdr server before sending the new Claude session a single message, herdr's own resume
   fails ("No conversation found"): Claude saves a conversation only after the first message. The agent pane is
   left as a shell; run open and devlayout resumes the folder's latest conversation with `claude --continue`.

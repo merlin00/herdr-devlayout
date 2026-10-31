@@ -22,3 +22,8 @@ First release. Requires herdr 0.9.5 or later (macOS, Linux).
 - Optional automatic repair at herdr server start (`DEVLAYOUT_STARTUP=1`).
 - Optional layout for new worktree workspaces (`DEVLAYOUT_WORKTREE=1`).
 - Errors and skipped roles are shown as a herdr notification when run from a key binding, action or hook.
+- For agents: `state` (the tab as JSON), `focus agent|editor|review`, `show FILE[:LINE[-END]]` (a
+  herdr-file-viewer popup) and `edit FILE [LINE]` (the editor pane's nvim). They move the focus only while
+  you look at the layout tab, otherwise they show a notification (`DEVLAYOUT_FOCUS`).
+- A Claude Code skill (`skills/devlayout`), linked with `devlayout install-skill`.
+- Run from a pane shell, devlayout uses the same settings and state folders as the plugin action.

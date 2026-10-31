@@ -62,7 +62,7 @@ If these keys are already taken in your setup, pick others; `herdr --default-con
 
 ## 3. (Optional) Put `devlayout` on your PATH
 
-Needed for opening files from reviewr (step 6) and handy for running commands by hand:
+Needed for opening files from reviewr (step 6) and for Claude (step 7), and handy for running commands by hand:
 
 ```sh
 mkdir -p ~/.local/bin
@@ -117,6 +117,51 @@ file open in nvim inside the reviewr pane; quit that nvim to get reviewr back.
 If you start nvim yourself and want it to receive these files, start it with
 `nvim --listen "$(devlayout editor-socket)"`.
 
+## 7. Let Claude guide you to the right pane
+
+Optional. Claude can bring you to the pane that fits the next step:
+
+- a plan, report or code location to **read** → a file viewer popup over the layout (close it with `q`)
+- a long text for **you to edit** (commit message, prompt, config) → the editor pane's nvim, with the file open
+- a **question** with choices → back to the Claude pane
+
+Requires step 3, and for the popup the file viewer plugin:
+
+```sh
+herdr plugin install smarzban/herdr-file-viewer
+devlayout install-skill                  # links the skill to ~/.claude/skills/devlayout
+```
+
+Start a new Claude session in the layout. Claude now uses these commands when they fit; you can also ask
+for them ("show me the plan in the viewer", "open the commit message in nvim"):
+
+| Command | What it does |
+|---|---|
+| `devlayout state` | prints this tab as JSON (which pane has which role, what runs, where you look) |
+| `devlayout focus agent\|editor\|review` | moves the focus to that pane |
+| `devlayout show docs/plan.md:10-30` | opens the file viewer popup at that range |
+| `devlayout edit notes.md 1` | opens the file in the editor pane's nvim and focuses it |
+
+The focus only moves while you look at the layout tab. If you are in another tab, you get a herdr
+notification instead. To never move the focus, set `DEVLAYOUT_FOCUS=off`.
+
+**Focus back to Claude on every question (hook).** Add this to `.claude/settings.json` in your project, or to
+`~/.claude/settings.json` for all projects:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion",
+        "hooks": [ { "type": "command", "command": "devlayout focus agent 'Claude has a question' >/dev/null 2>&1 || true" } ] }
+    ]
+  }
+}
+```
+
+Hooks are read when a Claude session starts, so restart Claude after adding it. Outside herdr,
+`devlayout focus` fails and the hook does nothing.
+
 ## Settings
 
 There is no settings file until you create one:
@@ -134,6 +179,7 @@ Remove the `#` in front of a line and change the value. Changes apply on the nex
 | `DEVLAYOUT_STARTUP` | `0` | `1`: when the herdr server starts, restart editor and review in every layout tab automatically |
 | `DEVLAYOUT_WORKTREE` | `0` | `1`: build the layout in workspaces created by `herdr worktree create`. Also set `auto_open = false` in reviewr's `config.toml`, or reviewr opens its own pane there |
 | `DEVLAYOUT_NOTIFY` | `auto` | herdr notifications for errors and skipped programs: `auto`, `on` or `off` |
+| `DEVLAYOUT_FOCUS` | `auto` | `off`: `focus`, `show` and `edit` never move the focus (step 7) |
 | `DEVLAYOUT_AGENT_CMD` | `claude` | program in the top-left pane |
 | `DEVLAYOUT_EDITOR` | `nvim` | editor in the bottom-left pane |
 | `DEVLAYOUT_REVIEW_CMD` | `herdr-reviewr` | program in the right pane |
@@ -160,8 +206,8 @@ functions are not available there; use command names on your PATH or absolute pa
 ```sh
 herdr plugin uninstall merlin00.devlayout     # or: herdr plugin unlink merlin00.devlayout
 rm -rf "$(herdr plugin config-dir merlin00.devlayout)" ~/.local/state/herdr/plugins/merlin00.devlayout \
-       ~/.local/state/devlayout ~/.local/bin/devlayout
+       ~/.local/bin/devlayout ~/.claude/skills/devlayout
 ```
 
 Then remove the two `[[keys.command]]` blocks from `~/.config/herdr/config.toml`, run
-`herdr server reload-config`, and set reviewr's `editor` back if you changed it.
+`herdr server reload-config`, set reviewr's `editor` back if you changed it, and remove the hooks from step 7.

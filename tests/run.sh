@@ -631,6 +631,136 @@ set_pane w1:p3 fg '"nvim"'
 out=$("$DL" 2>&1)
 check "hand-started nvim in the editor pane -> hint about --listen" 'printf %s "$out" | grep -qF "nvim --listen \"\$(devlayout editor-socket)\""'
 
+# ── state / focus / show / edit (for agent skills and hooks) ──
+focus_log() { q '(.focus_log // []) | join(",")'; }
+# The user looks at another tab: pane w1:p4 in tab t2 has the focus
+look_elsewhere() { set_pane w1:p1 focused false; set_pane w1:p4 focused true; }
+
+# T61 state of a 3-pane layout tab, as JSON
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"
+set_pane w1:p2 fg '"vim"'
+out=$("$DL" state 2>&1); rc=$?
+check "state -> valid JSON" '[ $rc -eq 0 ] && printf %s "$out" | jq -e . >/dev/null'
+check "state -> layout, viewing, focused role" '[ "$(printf %s "$out" | jq -r "[.layout, .viewing, .focused_role] | map(tostring) | join(\",\")")" = "devlayout,true,agent" ]'
+check "state -> role panes" '[ "$(printf %s "$out" | jq -r "[.roles.agent.pane, .roles.editor.pane, .roles.review.pane] | join(\",\")")" = "w1:p1,w1:p3,w1:p2" ]'
+check "state -> program states (agent detected, editor stopped, review pane busy)" '[ "$(printf %s "$out" | jq -r "[.roles.agent.state, .roles.editor.state, .roles.review.state] | join(\",\")")" = "running,stopped,busy vim" ]'
+check "state -> types nothing" '[ "$(nruns)" = 0 ]'
+
+# T62 state of a one-pane tab
+setup proj; state_panes ""
+out=$("$DL" state 2>&1)
+check "state, 1 pane -> layout single, roles missing" '[ "$(printf %s "$out" | jq -r "[.layout, .roles.editor.state] | join(\",\")")" = "single,missing" ]'
+
+# T63 state when the user looks at another tab
+setup proj; state_panes "claude,reviewr,nvim," "" "t1,t1,t1,t2"; look_elsewhere
+out=$("$DL" state 2>&1)
+check "state, user on another tab -> viewing false" '[ "$(printf %s "$out" | jq -r .viewing)" = false ]'
+
+# T64 focus editor / review
+setup proj; state_panes "claude,reviewr,nvim"
+out=$("$DL" focus editor 2>&1); rc=$?
+check "focus editor -> editor pane focused" '[ $rc -eq 0 ] && [ "$(focus_log)" = "w1:p3" ] && [ "$(q ".panes[] | select(.focused) | .pane_id")" = w1:p3 ]'
+out=$("$DL" focus review 2>&1)
+check "focus review (from the editor) -> review pane focused" '[ "$(focus_log)" = "w1:p3,w1:p2" ]'
+out=$("$DL" focus agent 2>&1)
+check "focus agent -> agent pane focused" '[ "$(q ".panes[] | select(.focused) | .pane_id")" = w1:p1 ]'
+out=$("$DL" focus agent 2>&1)
+check "focus on the focused pane -> nothing to do" '[ "$(focus_log)" = "w1:p3,w1:p2,w1:p1" ]'
+
+# T65 the user looks at another tab -> focus stays, a notification instead
+setup proj; state_panes "claude,reviewr,nvim," "" "t1,t1,t1,t2"; look_elsewhere
+out=$("$DL" focus agent "Claude has a question" 2>&1); rc=$?
+check "focus, user on another tab -> focus unchanged" '[ $rc -eq 0 ] && [ -z "$(focus_log)" ] && [ "$(q ".panes[] | select(.focused) | .pane_id")" = w1:p4 ]'
+check "focus, user on another tab -> notification with the message" '[ "$(q ".notifications[0].body")" = "Claude has a question" ]'
+
+# T66 DEVLAYOUT_FOCUS=off -> never move the focus
+setup proj; state_panes "claude,reviewr,nvim"
+echo DEVLAYOUT_FOCUS=off >"$HERDR_PLUGIN_CONFIG_DIR/config.env"
+out=$("$DL" focus editor 2>&1); rc=$?
+check "DEVLAYOUT_FOCUS=off -> focus unchanged, notification" '[ $rc -eq 0 ] && [ -z "$(focus_log)" ] && [ "$(nnotes)" = 1 ]'
+
+# T67 focus errors
+setup proj; state_panes "claude,reviewr,nvim"
+out=$("$DL" focus nope 2>&1); rc=$?
+check "focus unknown role -> usage error" '[ $rc -ne 0 ] && printf %s "$out" | grep -q "usage: devlayout focus"'
+setup proj; state_panes ""
+out=$("$DL" focus editor 2>&1); rc=$?
+check "focus, no editor pane -> error that says run open" '[ $rc -ne 0 ] && printf %s "$out" | grep -q "run open"'
+
+# T68 show FILE:LINE -> file viewer popup rooted at the project
+setup proj; state_panes "claude,reviewr,nvim"
+mkdir -p "$PROJ/docs"; echo x >"$PROJ/docs/plan.md"
+out=$(cd "$PROJ" && "$DL" show docs/plan.md:30-40 2>&1); rc=$?
+opened=$(q '.plugin_opens[0] // [] | join(" ")')
+check "show -> popup with the target" '[ $rc -eq 0 ] && printf %s "$opened" | grep -qF -- "--placement popup" && printf %s "$opened" | grep -qF "HERDR_FILE_VIEWER_OPEN=docs/plan.md:30-40"'
+check "show -> rooted at the project" 'printf %s "$opened" | grep -qF "HERDR_FILE_VIEWER_ROOT=$(cd "$PROJ" && pwd -P)"'
+check "show -> plugin and entrypoint" 'printf %s "$opened" | grep -qF -- "--plugin herdr-file-viewer --entrypoint file-viewer"'
+
+# T69 show: a colon that is not a line number belongs to the file name
+setup proj; state_panes "claude,reviewr,nvim"
+echo x >"$PROJ/a:b.md"
+out=$("$DL" show "$PROJ/a:b.md" 2>&1); rc=$?
+check "show a:b.md -> whole name is the file" '[ $rc -eq 0 ] && q ".plugin_opens[0] | join(\" \")" | grep -qF "HERDR_FILE_VIEWER_OPEN=a:b.md"'
+
+# T70 show errors: popup already open, viewer not installed, missing file
+setup proj; state_panes "claude,reviewr,nvim"; echo x >"$PROJ/a.md"
+out=$(MOCK_PLUGIN_ERR=ui_busy "$DL" show "$PROJ/a.md" 2>&1); rc=$?
+check "show, popup already open -> error says close it" '[ $rc -ne 0 ] && printf %s "$out" | grep -q "already open"'
+out=$(MOCK_PLUGIN_ERR=plugin_not_found "$DL" show "$PROJ/a.md" 2>&1); rc=$?
+check "show, viewer not installed -> install hint" '[ $rc -ne 0 ] && printf %s "$out" | grep -q "herdr plugin install smarzban/herdr-file-viewer"'
+out=$("$DL" show "$PROJ/nope.md" 2>&1); rc=$?
+check "show, no such file -> error" '[ $rc -ne 0 ] && printf %s "$out" | grep -q "no such file"'
+
+# T71 show while the user looks at another tab -> no popup there, a notification instead
+setup proj; state_panes "claude,reviewr,nvim," "" "t1,t1,t1,t2"; look_elsewhere; echo x >"$PROJ/a.md"
+out=$("$DL" show "$PROJ/a.md" 2>&1); rc=$?
+check "show, user on another tab -> no popup, notification" '[ $rc -eq 0 ] && [ "$(q "(.plugin_opens // []) | length")" = 0 ] && [ "$(nnotes)" = 1 ]'
+
+# T72 edit with a listening editor -> :drop, then focus the editor pane
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+echo x >"$PROJ/a.txt"
+out=$(PATH="$T/bin:$PATH" "$DL" edit "$PROJ/a.txt" 12 2>&1); rc=$?
+check "edit, editor listening -> :drop and line sent" '[ $rc -eq 0 ] && grep -qF ":drop $(cd "$PROJ" && pwd -P)/a.txt<CR>:12<CR>" "$NVIM_LOG"'
+check "edit, editor listening -> editor pane focused" '[ "$(focus_log)" = w1:p3 ]'
+
+# T73 edit with the editor quit -> nvim started in the editor pane with the file, then focus
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+rm -f "$("$DL" editor-socket "$PROJ")"; echo x >"$PROJ/a.txt"
+out=$(PATH="$T/bin:$PATH" "$DL" edit "$PROJ/a.txt" 12 2>&1); rc=$?
+check "edit, editor quit -> started in the editor pane" '[ $rc -eq 0 ] && runs_for w1:p3 | grep -qF "+12" && [ "$(focus_log)" = w1:p3 ]'
+check "edit, editor quit -> typed text is valid shell" 'all_runs_parse'
+
+# T74 edit with the editor pane busy -> error, nothing typed, nvim never started here
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+rm -f "$("$DL" editor-socket "$PROJ")"; echo x >"$PROJ/a.txt"
+set_pane w1:p3 fg '"vim"'
+out=$(PATH="$T/bin:$PATH" "$DL" edit "$PROJ/a.txt" 12 2>&1); rc=$?
+check "edit, editor pane busy -> error, nothing typed or run" '[ $rc -ne 0 ] && [ "$(nruns)" = 0 ] && ! grep -qF "+12" "$NVIM_LOG" 2>/dev/null && [ -z "$(focus_log)" ]'
+
+# T75 edit a file of another project -> error
+setup proj; state_panes "claude,reviewr,nvim" "claude,,"; fake_nvim
+mkdir -p "$T/other"; echo x >"$T/other/b.txt"
+out=$(PATH="$T/bin:$PATH" "$DL" edit "$T/other/b.txt" 2>&1); rc=$?
+check "edit, other project -> error, nothing sent" '[ $rc -ne 0 ] && printf %s "$out" | grep -q "not in this tab" && ! grep -q drop "$NVIM_LOG" 2>/dev/null'
+
+# T77 run from a pane shell (no HERDR_PLUGIN_*_DIR): the same settings and state as the plugin action
+setup proj; state_panes ""
+mkdir -p "$T/home/.config/herdr/plugins/config/merlin00.devlayout"
+echo DEVLAYOUT_REVIEW_CMD=my-review >"$T/home/.config/herdr/plugins/config/merlin00.devlayout/config.env"
+out=$(env -u HERDR_PLUGIN_STATE_DIR -u HERDR_PLUGIN_CONFIG_DIR -u XDG_CONFIG_HOME -u XDG_STATE_HOME HOME="$T/home" "$DL" open 2>&1); rc=$?
+check "shell run -> reads the plugin's config.env" '[ $rc -eq 0 ] && runs_for w1:p2 | grep -q "exec my-review"'
+check "shell run -> keeps state in the plugin's state folder" '[ -n "$(ls "$T/home/.local/state/herdr/plugins/merlin00.devlayout/run/" 2>/dev/null)" ]'
+
+# T76 install-skill -> link into the Claude skills folder; never replaces a real folder
+setup proj
+out=$(CLAUDE_CONFIG_DIR="$T/claude" "$DL" install-skill 2>&1); rc=$?
+check "install-skill -> link to the bundled skill" '[ $rc -eq 0 ] && [ -L "$T/claude/skills/devlayout" ] && [ -f "$T/claude/skills/devlayout/SKILL.md" ]'
+out=$(CLAUDE_CONFIG_DIR="$T/claude" "$DL" install-skill 2>&1); rc=$?
+check "install-skill again -> fine" '[ $rc -eq 0 ] && [ -L "$T/claude/skills/devlayout" ]'
+rm -f "$T/claude/skills/devlayout"; mkdir -p "$T/claude/skills/devlayout"
+out=$(CLAUDE_CONFIG_DIR="$T/claude" "$DL" install-skill 2>&1); rc=$?
+check "install-skill over a real folder -> error, folder kept" '[ $rc -ne 0 ] && [ -d "$T/claude/skills/devlayout" ] && [ ! -L "$T/claude/skills/devlayout" ]'
+
 echo
 echo "result: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
